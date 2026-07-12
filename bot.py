@@ -21,13 +21,10 @@ apihelper.READ_TIMEOUT = 120
 bot = TeleBot(BOT_TOKEN, threaded=True)
 
 # --- FFmpeg YO'LINI ANIQLASH (Windows va Linux/Render uchun) ---
-# Tizim Windows bo'lsa Windows papkasini, Linux bo'lsa Render-dagi yuklangan static FFmpeg-ni oladi
 if platform.system() == "Windows":
     FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
 else:
-    # Render (Linux) uchun build.sh yuklab beradigan joy
     FFMPEG_PATH = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
-    # Agar u yerda topilmasa, tizim standart ffmpeg buyrug'iga tayanadi
     if not os.path.exists(FFMPEG_PATH):
         FFMPEG_PATH = "ffmpeg"
 
@@ -37,14 +34,12 @@ DB_FILE = "bot_database.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Foydalanuvchilar jadvali
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT
         )
     """)
-    # Majburiy a'zolik kanallari jadvali
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             channel_id TEXT PRIMARY KEY,
@@ -55,7 +50,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Ma'lumotlar bazasini yaratish/tekshirish
 init_db()
 
 def add_user(user_id, username):
@@ -129,14 +123,22 @@ def is_ffmpeg_installed():
     except FileNotFoundError:
         return False
 
-# --- FFmpeg ORQALI VIDEOLARNI QAYTA ISHLASH ---
+# --- ULTRA TEZKOR FFmpeg FUNKSIYALARI ---
 def make_square_video(input_path, output_path):
+    """
+    Kuchsiz serverlar uchun ultra-tezkor sozlangan kvadrat video qilish buyrug'i.
+    Hajm 360x360 qilingan, preset 'ultrafast' va threads cheklangan.
+    """
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
         '-t', '60',  # Maksimal 60 soniya
-        '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480",
-        '-c:v', 'libx264', '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '128k', '-strict', '-2',
+        '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=360:360",
+        '-c:v', 'libx264', 
+        '-preset', 'ultrafast',  # Eng tezkor siqish
+        '-crf', '26',            # Optimal siqish sifati (xotirani tejaydi)
+        '-threads', '2',         # Render CPU bandligi uchun optimal
+        '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '64k', '-strict', '-2',
         output_path
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -144,10 +146,17 @@ def make_square_video(input_path, output_path):
         raise Exception(f"FFmpeg xatosi: {result.stderr}")
 
 def make_normal_video(input_path, output_path):
+    """
+    Dumaloq videoni oddiy videoga o'tkazuvchi tezkor buyruq.
+    """
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
+        '-c:v', 'libx264', 
+        '-preset', 'ultrafast', 
+        '-crf', '26',
+        '-threads', '2',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '96k',
         output_path
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -173,7 +182,7 @@ def get_admin_reply_keyboard():
     keyboard.add(types.KeyboardButton("⚙️ Admin Panel"))
     return keyboard
 
-# --- HANDLERS (START & ADMIN) ---
+# --- HANDLERS ---
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
@@ -216,7 +225,7 @@ def admin_button_click_handler(message):
     bot.send_message(message.chat.id, "⚙️ <b>Admin Panelga xush kelibsiz!</b>\nKerakli bo'limni tanlang:",
                      reply_markup=get_admin_keyboard(), parse_mode="HTML")
 
-# --- VIDEO QAYTA ISHLASH (MAIN LOGIC) ---
+# --- MAIN VIDEO CONVERSION LOGIC ---
 
 @bot.message_handler(content_types=['video'])
 def handle_normal_video(message):
@@ -226,14 +235,14 @@ def handle_normal_video(message):
         return
 
     if not is_ffmpeg_installed():
-        bot.reply_to(message, "❌ Tizimda FFmpeg dasturi topilmadi! Iltimos, ffmpeg papkasi C:\\ diskida borligini tekshiring.")
+        bot.reply_to(message, "❌ Tizimda FFmpeg dasturi topilmadi! Iltimos, server sozlamalarini tekshiring.")
         return
 
     if message.video.file_size > 20 * 1024 * 1024:
         bot.reply_to(message, "⚠️ Video hajmi juda katta! 20 MB gacha video yuboring.")
         return
 
-    status_msg = bot.reply_to(message, "⏳ Videongiz qabul qilindi. Dumaloq shaklga keltirilmoqda, iltimos kuting...")
+    status_msg = bot.reply_to(message, "⏳ Videongiz qabul qilindi. Tezkor rejimda qayta ishlanmoqda, kuting...")
 
     def process():
         input_name = f"in_{message.chat.id}_{message.message_id}.mp4"
@@ -250,8 +259,6 @@ def handle_normal_video(message):
             with open(output_name, 'rb') as video_note:
                 bot.send_video_note(message.chat.id, video_note, reply_to_message_id=message.message_id, timeout=120)
             
-            if os.path.exists(input_name): os.remove(input_name)
-            if os.path.exists(output_name): os.remove(output_name)
             bot.delete_message(message.chat.id, status_msg.message_id)
             
         except Exception as e:
@@ -259,6 +266,8 @@ def handle_normal_video(message):
             safe_error = html.escape(str(e)[:100])
             bot.edit_message_text(f"❌ Videoni qayta ishlashda xatolik yuz berdi.\nBatafsil: {safe_error}", 
                                   message.chat.id, status_msg.message_id)
+        finally:
+            # Fayllar har qanday holatda ham diskdan darhol o'chirilishi shart
             if os.path.exists(input_name): os.remove(input_name)
             if os.path.exists(output_name): os.remove(output_name)
 
@@ -275,7 +284,7 @@ def handle_round_video(message):
         bot.reply_to(message, "❌ Tizimda FFmpeg dasturi topilmadi!")
         return
 
-    status_msg = bot.reply_to(message, "⏳ Dumaloq video qabul qilindi. Oddiy video formatiga o'tkazilmoqda...")
+    status_msg = bot.reply_to(message, "⏳ Dumaloq video qabul qilindi. Tezkor rejimda o'tkazilmoqda...")
 
     def process():
         input_name = f"in_{message.chat.id}_{message.message_id}.mp4"
@@ -292,8 +301,6 @@ def handle_round_video(message):
             with open(output_name, 'rb') as video:
                 bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id, caption="🎥 Videongiz tayyor!", timeout=120)
             
-            if os.path.exists(input_name): os.remove(input_name)
-            if os.path.exists(output_name): os.remove(output_name)
             bot.delete_message(message.chat.id, status_msg.message_id)
             
         except Exception as e:
@@ -301,6 +308,7 @@ def handle_round_video(message):
             safe_error = html.escape(str(e)[:100])
             bot.edit_message_text(f"❌ Qayta ishlashda xatolik yuz berdi.\nBatafsil: {safe_error}", 
                                   message.chat.id, status_msg.message_id)
+        finally:
             if os.path.exists(input_name): os.remove(input_name)
             if os.path.exists(output_name): os.remove(output_name)
 
@@ -378,7 +386,6 @@ def process_broadcast(message):
 
 def process_add_channel(message):
     try:
-        # 1. AGAR ADMIN KANALDAN POST YO'NALTIRGAN (FORWARD) BO'LSA
         if message.forward_from_chat and message.forward_from_chat.type == "channel":
             chat = message.forward_from_chat
             channel_id = str(chat.id)
@@ -391,14 +398,12 @@ def process_add_channel(message):
             bot.send_message(message.chat.id, f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n📢 Nomi: {safe_name}", parse_mode="HTML")
             return
 
-        # 2. AGAR ADMIN MATN KO'RINISHIDA USERNAME YOKI HAVOLA YUBORGAN BO'LSA
         if not message.text:
             bot.send_message(message.chat.id, "❌ Iltimos, kanal username'ini yuboring yoki biror postni yo'naltiring!")
             return
 
         text = message.text.strip()
         
-        # ID | Nomi | Havola formatida bo'lsa
         if "|" in text:
             parts = text.split("|")
             channel_id = parts[0].strip()
@@ -406,19 +411,16 @@ def process_add_channel(message):
             invite_link = parts[2].strip()
         else:
             channel_id = text
-            # t.me linklarini username'ga o'tkazish
             if "t.me/" in channel_id:
                 parts = channel_id.split("t.me/")
                 username_part = parts[1].split("/")[0].split("?")[0].strip()
                 if not username_part.startswith("+") and not username_part.startswith("joinchat"):
                     channel_id = "@" + username_part
             
-            # Formatsiz username'ga @ qo'shish
             if not channel_id.startswith("@") and not channel_id.startswith("-"):
                 if not channel_id.replace("-", "").isdigit():
                     channel_id = "@" + channel_id
             
-            # Telegram API orqali kanal ma'lumotlarini olish
             chat = bot.get_chat(channel_id)
             channel_name = chat.title
             invite_link = f"https://t.me/{chat.username}" if chat.username else "https://t.me/"
@@ -469,7 +471,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive and running 24/7!")
 
     def log_message(self, format, *args):
-        return  # Konsolni ortiqcha ping xabarlari bilan to'ldirmaymiz
+        return
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
@@ -478,7 +480,6 @@ def run_health_server():
 
 # --- MAIN ---
 if __name__ == "__main__":
-    # Render-da port scan timeout bo'lmasligi uchun alohida thread-da kichik web-server ishga tushadi
     threading.Thread(target=run_health_server, daemon=True).start()
     print("Web server portda ishga tushdi...")
     print("Bot muvaffaqiyatli ishga tushdi...")
