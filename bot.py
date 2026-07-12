@@ -5,6 +5,7 @@ import threading
 import traceback
 import html
 import platform
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telebot import TeleBot, types
 from telebot import apihelper
@@ -13,9 +14,9 @@ from telebot import apihelper
 BOT_TOKEN = "8357374445:AAFJfx3qYEc-fWVEZ-T-O3tILQ5UO74m6Lc"  # Bot Token
 ADMIN_ID = 6377032074                                       # Admin ID
 
-# Tarmoq ulanish xatoliklari va timeout muammolarini hal qilish uchun kutish vaqtlarini oshiramiz (120 soniya)
-apihelper.CONNECT_TIMEOUT = 120
-apihelper.READ_TIMEOUT = 120
+# Tarmoq ulanish xatoliklari va timeout muammolarini hal qilish uchun kutish vaqtlarini maksimal oshiramiz
+apihelper.CONNECT_TIMEOUT = 300
+apihelper.READ_TIMEOUT = 300
 
 # Botni yaratish
 bot = TeleBot(BOT_TOKEN, threaded=True)
@@ -123,22 +124,23 @@ def is_ffmpeg_installed():
     except FileNotFoundError:
         return False
 
-# --- ULTRA TEZKOR FFmpeg FUNKSIYALARI ---
+# --- YUQORI SIFATLI (HQ) FFmpeg FUNKSIYALARI ---
 def make_square_video(input_path, output_path):
     """
-    Kuchsiz serverlar uchun ultra-tezkor sozlangan kvadrat video qilish buyrug'i.
-    Hajm 360x360 qilingan, preset 'ultrafast' va threads cheklangan.
+    Sifatni mutlaqo yo'qotmagan holda videoni dumaloq qilish.
+    O'lchami 480x480 (Teleskop uchun tiniq format), sifati esa yuqori (-crf 20).
     """
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
-        '-t', '60',  # Maksimal 60 soniya
-        '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=360:360",
+        '-t', '60',                 # Maksimal 60 soniya
+        '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480", # Tiniq HD dumaloq video o'lchami
         '-c:v', 'libx264', 
-        '-preset', 'ultrafast',  # Eng tezkor siqish
-        '-crf', '26',            # Optimal siqish sifati (xotirani tejaydi)
-        '-threads', '2',         # Render CPU bandligi uchun optimal
+        '-preset', 'ultrafast',     # Tezkor siqish (fayl sifatini buzmaydi, faqat vaqtni tejaydi)
+        '-crf', '20',               # Yuqori tiniqlik darajasi (asl holatidek saqlaydi)
+        '-threads', '2',
         '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '64k', '-strict', '-2',
+        '-c:a', 'aac', '-b:a', '128k', # Yuqori sifatli audio (128kbps)
+        '-strict', '-2',
         output_path
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -147,16 +149,16 @@ def make_square_video(input_path, output_path):
 
 def make_normal_video(input_path, output_path):
     """
-    Dumaloq videoni oddiy videoga o'tkazuvchi tezkor buyruq.
+    Dumaloq videoni tiniq sifatda oddiy videoga o'tkazish.
     """
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
         '-c:v', 'libx264', 
         '-preset', 'ultrafast', 
-        '-crf', '26',
+        '-crf', '20',
         '-threads', '2',
         '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '96k',
+        '-c:a', 'aac', '-b:a', '128k',
         output_path
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -242,32 +244,46 @@ def handle_normal_video(message):
         bot.reply_to(message, "⚠️ Video hajmi juda katta! 20 MB gacha video yuboring.")
         return
 
-    status_msg = bot.reply_to(message, "⏳ Videongiz qabul qilindi. Tezkor rejimda qayta ishlanmoqda, kuting...")
+    status_msg = bot.reply_to(message, "⏳ Videongiz qabul qilindi. Dumaloq shaklga keltirilmoqda, iltimos kuting...")
 
     def process():
         input_name = f"in_{message.chat.id}_{message.message_id}.mp4"
         output_name = f"out_{message.chat.id}_{message.message_id}.mp4"
         try:
+            # Faylni serverga yuklab olish
             file_info = bot.get_file(message.video.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
             
             with open(input_name, 'wb') as new_file:
                 new_file.write(downloaded_file)
             
+            # FFmpeg orqali sifatli konvertatsiya qilish
             make_square_video(input_name, output_name)
             
-            with open(output_name, 'rb') as video_note:
-                bot.send_video_note(message.chat.id, video_note, reply_to_message_id=message.message_id, timeout=120)
+            # Telegram-ga qayta yuborish (Xatolikni oldini olish uchun xavfsiz Retry mexanizmi bilan)
+            success = False
+            for attempt in range(3): # Jami 3 marta urinib ko'radi
+                try:
+                    with open(output_name, 'rb') as video_note:
+                        # Timeout vaqtini 5 daqiqa (300 soniya) qildik!
+                        bot.send_video_note(message.chat.id, video_note, reply_to_message_id=message.message_id, timeout=300)
+                    success = True
+                    break
+                except Exception as upload_error:
+                    print(f"[URINISH {attempt+1} MUVAFFAQIYATSIZ]: {str(upload_error)}")
+                    time.sleep(3) # Keyingi urinishdan oldin 3 soniya kutadi
             
-            bot.delete_message(message.chat.id, status_msg.message_id)
+            if success:
+                bot.delete_message(message.chat.id, status_msg.message_id)
+            else:
+                raise Exception("Telegram serveriga videoni yuklashda bir necha bor urinish muvaffaqiyatsiz tugadi (Tarmoq yuklash vaqti tugadi).")
             
         except Exception as e:
             traceback.print_exc()
-            safe_error = html.escape(str(e)[:100])
+            safe_error = html.escape(str(e)[:120])
             bot.edit_message_text(f"❌ Videoni qayta ishlashda xatolik yuz berdi.\nBatafsil: {safe_error}", 
                                   message.chat.id, status_msg.message_id)
         finally:
-            # Fayllar har qanday holatda ham diskdan darhol o'chirilishi shart
             if os.path.exists(input_name): os.remove(input_name)
             if os.path.exists(output_name): os.remove(output_name)
 
@@ -284,7 +300,7 @@ def handle_round_video(message):
         bot.reply_to(message, "❌ Tizimda FFmpeg dasturi topilmadi!")
         return
 
-    status_msg = bot.reply_to(message, "⏳ Dumaloq video qabul qilindi. Tezkor rejimda o'tkazilmoqda...")
+    status_msg = bot.reply_to(message, "⏳ Dumaloq video qabul qilindi. Oddiy video formatiga o'tkazilmoqda...")
 
     def process():
         input_name = f"in_{message.chat.id}_{message.message_id}.mp4"
@@ -298,14 +314,26 @@ def handle_round_video(message):
             
             make_normal_video(input_name, output_name)
             
-            with open(output_name, 'rb') as video:
-                bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id, caption="🎥 Videongiz tayyor!", timeout=120)
-            
-            bot.delete_message(message.chat.id, status_msg.message_id)
+            # Telegram-ga qayta yuborish (Xavfsiz retry bilan)
+            success = False
+            for attempt in range(3):
+                try:
+                    with open(output_name, 'rb') as video:
+                        bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id, caption="🎥 Videongiz tayyor!", timeout=300)
+                    success = True
+                    break
+                except Exception as upload_error:
+                    print(f"[URINISH {attempt+1} MUVAFFAQIYATSIZ]: {str(upload_error)}")
+                    time.sleep(3)
+
+            if success:
+                bot.delete_message(message.chat.id, status_msg.message_id)
+            else:
+                raise Exception("Telegram serveriga yuklashda vaqt tugadi.")
             
         except Exception as e:
             traceback.print_exc()
-            safe_error = html.escape(str(e)[:100])
+            safe_error = html.escape(str(e)[:120])
             bot.edit_message_text(f"❌ Qayta ishlashda xatolik yuz berdi.\nBatafsil: {safe_error}", 
                                   message.chat.id, status_msg.message_id)
         finally:
@@ -476,7 +504,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
 
 # --- MAIN ---
 if __name__ == "__main__":
