@@ -130,19 +130,22 @@ def is_ffmpeg_installed():
 def make_square_video(input_path, output_path):
     """
     Sifatni mutlaqo yo'qotmagan holda videoni dumaloq qilish.
-    Preset 'superfast' qilib o'zgartirildi. Bu sifatni buzmaydi (CRF 20 saqlangan), 
-    lekin fayl hajmini 'ultrafast'dan ko'ra sezilarli darajada kichik qiladi, yuklashni tezlashtiradi!
+    '-preset veryfast' va '-movflags +faststart' qo'llandi. 
+    Bu vizual sifatni mutlaqo o'zgartirmaydi (CRF 20 saqlangan), 
+    lekin fayl hajmini kichraytiradi va Telegram tezroq qabul qilishi uchun metadata indeksini boshiga ko'chiradi!
     """
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
         '-t', '60',                 # Maksimal 60 soniya
-        '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480", # Tiniq HD dumaloq video o'lchami
+        '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480", # Standart HD dumaloq video o'lchami
         '-c:v', 'libx264', 
-        '-preset', 'superfast',     # Sifatli va tezkor siqish (fayl hajmini kichraytiradi)
-        '-crf', '20',               # Asl tiniqlik darajasi (mutlaqo tiniq sifat)
+        '-preset', 'veryfast',      # Yuqori tezlik va yaxshi siqish nisbati
+        '-crf', '20',               # Asl tiniqlik darajasi (juda yuqori sifat)
         '-threads', '2',
+        '-movflags', '+faststart',  # Telegram tezda yuklab olishni boshlashi uchun metadata indeksini boshiga o'tkazish
         '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '128k', # Yuqori sifatli audio (128kbps)
+        '-ac', '1',                 # Audioni mono qilish (Render yuklash tezligini tejaydi)
+        '-c:a', 'aac', '-b:a', '64k',  # Yuqori va toza audio sifati (64kbps)
         '-strict', '-2',
         output_path
     ]
@@ -157,11 +160,12 @@ def make_normal_video(input_path, output_path):
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
         '-c:v', 'libx264', 
-        '-preset', 'superfast', 
+        '-preset', 'veryfast', 
         '-crf', '20',
         '-threads', '2',
+        '-movflags', '+faststart',
         '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '128k',
+        '-ac', '1', '-c:a', 'aac', '-b:a', '64k',
         output_path
     ]
     result = subprocess.run(command, capture_output=True, text=True)
