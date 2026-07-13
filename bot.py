@@ -6,6 +6,7 @@ import traceback
 import html
 import platform
 import time
+import socket  # Global tarmoq timeoutini sozlash uchun
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telebot import TeleBot, types
 from telebot import apihelper
@@ -17,6 +18,7 @@ ADMIN_ID = 6377032074                                       # Admin ID
 # Tarmoq ulanish xatoliklari va timeout muammolarini hal qilish uchun kutish vaqtlarini maksimal oshiramiz
 apihelper.CONNECT_TIMEOUT = 300
 apihelper.READ_TIMEOUT = 300
+socket.setdefaulttimeout(360)  # Global socket timeoutini 6 daqiqa qilib belgilaymiz (Sekin internet uchun xaloskor)
 
 # Botni yaratish
 bot = TeleBot(BOT_TOKEN, threaded=True)
@@ -128,15 +130,16 @@ def is_ffmpeg_installed():
 def make_square_video(input_path, output_path):
     """
     Sifatni mutlaqo yo'qotmagan holda videoni dumaloq qilish.
-    O'lchami 480x480 (Teleskop uchun tiniq format), sifati esa yuqori (-crf 20).
+    Preset 'superfast' qilib o'zgartirildi. Bu sifatni buzmaydi (CRF 20 saqlangan), 
+    lekin fayl hajmini 'ultrafast'dan ko'ra sezilarli darajada kichik qiladi, yuklashni tezlashtiradi!
     """
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
         '-t', '60',                 # Maksimal 60 soniya
         '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480", # Tiniq HD dumaloq video o'lchami
         '-c:v', 'libx264', 
-        '-preset', 'ultrafast',     # Tezkor siqish (fayl sifatini buzmaydi, faqat vaqtni tejaydi)
-        '-crf', '20',               # Yuqori tiniqlik darajasi (asl holatidek saqlaydi)
+        '-preset', 'superfast',     # Sifatli va tezkor siqish (fayl hajmini kichraytiradi)
+        '-crf', '20',               # Asl tiniqlik darajasi (mutlaqo tiniq sifat)
         '-threads', '2',
         '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '128k', # Yuqori sifatli audio (128kbps)
@@ -154,7 +157,7 @@ def make_normal_video(input_path, output_path):
     command = [
         FFMPEG_PATH, '-y', '-i', input_path,
         '-c:v', 'libx264', 
-        '-preset', 'ultrafast', 
+        '-preset', 'superfast', 
         '-crf', '20',
         '-threads', '2',
         '-pix_fmt', 'yuv420p',
@@ -504,6 +507,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()  # Tuzatildi! Endi server doimiy ishlaydi.
 
 # --- MAIN ---
 if __name__ == "__main__":
