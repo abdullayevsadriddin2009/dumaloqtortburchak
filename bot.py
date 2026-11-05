@@ -72,7 +72,7 @@ def _env_int(name, default=0):
 
 # --- ASOSIY SOZLAMALAR (shu yerni o'zgartirasiz) ---
 # BotFather bergan token:
-DEFAULT_BOT_TOKEN = "8357374445:AAFJfx3qYEc-fWVEZ-T-O3tILQ5UO74m6Lc"
+DEFAULT_BOT_TOKEN = "8357374445:AAF95N5NmF-94w6tDXyCkJNNFL5Irt29X6k"
 # Adminning Telegram ID si (bir nechta bo'lsa vergul bilan: "111,222"):
 DEFAULT_ADMIN_ID = "6377032074"
 
@@ -393,7 +393,9 @@ def make_square_video(input_path, output_path):
         "-t", "59",                                      # video note chegarasi
         "-map", "[v]", "-map", "0:a:0?",                 # audio bo'lmasa ham ishlaydi
         "-filter_complex", filter_complex,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-threads", "2",
+        # veryfast + crf 17: o'lchovda "fast/crf18" dan ~3.5x tez,
+        # sifat deyarli bir xil (SSIM 0.9975 / 0.9980)
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-threads", "2",
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
@@ -426,7 +428,7 @@ def make_rectangle_video(input_path, output_path):
         "-i", input_path,
         "-filter_complex", filter_complex,
         "-map", "[v]", "-map", "0:a:0?",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-threads", "2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-threads", "2",
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
@@ -1174,13 +1176,34 @@ def main():
     print("Bot muvaffaqiyatli ishga tushdi...")
     # skip_pending=True: bot qayta ishga tushganda eski (masalan, tugallanmagan
     # ommaviy xabar) so'rovlar bajarilmaydi.
-    bot.infinity_polling(
-        timeout=60,
-        long_polling_timeout=60,
-        skip_pending=True,
-        none_stop=True,
-        allowed_updates=ALLOWED_UPDATES,
-    )
+    # 409 Conflict: bir xil token bilan ikkinchi nusxa ishlayotgan bo'lsa
+    # Telegram shu xatoni beradi. Bot o'chib qolmasligi uchun kutib qayta urinamiz.
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=60,
+                long_polling_timeout=60,
+                skip_pending=False,
+                none_stop=True,
+                allowed_updates=ALLOWED_UPDATES,
+            )
+        except ApiTelegramException as error:
+            if error.error_code == 409:
+                print(
+                    "[POLL] 409 Conflict: bu token bilan boshqa nusxa bot ishlayapti.\n"
+                    "       Eski deployni to'xtating yoki tokenni @BotFather'da almashtiring.\n"
+                    "       20 soniyadan keyin qayta urinish..."
+                )
+                time.sleep(20)
+            elif error.error_code in (401, 404):
+                print(f"[POLL] Token qabul qilinmadi ({error.error_code}). To'xtatildi.")
+                sys.exit(1)
+            else:
+                traceback.print_exc()
+                time.sleep(5)
+        except Exception:
+            traceback.print_exc()
+            time.sleep(5)
 
 
 if __name__ == "__main__":
