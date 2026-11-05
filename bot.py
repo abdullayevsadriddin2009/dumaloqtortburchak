@@ -86,6 +86,19 @@ ADMIN_IDS = {
 DB_FILE = _env("DB_FILE", os.path.join(BASE_DIR, "bot_database.db"))
 MAX_INPUT_MB = _env_int("MAX_INPUT_MB", 20)
 MAX_WORKERS = max(1, _env_int("MAX_WORKERS", 2))
+# Telegram botga qaysi turdagi yangilanishlar kerak. callback_query BO'LMASA
+# inline tugmalar (admin panel) umuman ishlamaydi — shuning uchun ro'yxat
+# ochiq yozilgan va har bir poll so'rovida yuboriladi.
+ALLOWED_UPDATES = [
+    "message",
+    "edited_message",
+    "callback_query",
+    "my_chat_member",
+    "chat_member",
+    "inline_query",
+    "chosen_inline_result",
+]
+
 PORT = _env_int("PORT", 8080)
 STEP_TTL = 600          # admin amallari uchun kutish vaqti (soniya)
 BROADCAST_TTL = 900     # ommaviy xabarni tasdiqlash muddati (soniya)
@@ -390,21 +403,23 @@ def make_square_video(input_path, output_path):
 
 
 def make_rectangle_video(input_path, output_path):
-    """Dumaloq videoni oddiy to'rtburchak (16:9) videoga aylantiradi.
+    """Dumaloq (kvadrat) videoni to'liq kadrli 16:9 videoga aylantiradi.
 
-    Video asl o'lchamida o'rtaga qo'yiladi (kattalashtirilmaydi), chetlari
-    blur (xira) fon bilan to'ldiriladi — cho'zilmaydi, qirqilmaydi,
-    sifat yo'qolmaydi. Balandlik 1080px dan oshsa, butun video mutanosib
-    ravishda 1080px ga tushiriladi (fayl hajmi cheksiz o'smasligi uchun).
+    Yon tomonlarda xira (blur) fon QO'YILMAYDI: video o'rtasidan 16:9
+    qirqiladi va kadrni to'liq egallaydi. Qirqish asl piksellarda
+    bajariladi — video kattalashtirilmaydi, shuning uchun sifat
+    yo'qolmaydi. Kenglik 1920px dan oshsa, mutanosib kichraytiriladi.
     """
+    # Markazdan 16:9 qirqish: kengroq videoda yon, balandroq videoda tepa/past
+    # qirqiladi. Qirqish asl piksellarda, hech qanday kattalashtirish yo'q.
+    crop_expr = (
+        "crop=w='if(gte(iw/ih,1.7777),trunc(ih*16/9/2)*2,trunc(iw/2)*2)':"
+        "h='if(gte(iw/ih,1.7777),trunc(ih/2)*2,trunc(iw*9/16/2)*2)'"
+    )
     filter_complex = (
-        # fon: asl balandlikdan 16:9 o'lcham, keyin xiralashtiriladi
-        "[0:v]split=2[bg0][fg0];"
-        "[bg0]scale=w='trunc(ih*16/9/2)*2':h='trunc(ih/2)*2',"
-        "boxblur=24:2,setsar=1[bg];"
-        # asosiy video: asl o'lchamda, faqat 1080px dan baland bo'lsa kichrayadi
-        "[fg0]scale=w=-2:h='min(trunc(ih/2)*2,1080)',setsar=1[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
+        "[0:v]" + crop_expr + ","
+        "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+        "setsar=1,format=yuv420p[v]"
     )
     command = [
         FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
@@ -1120,6 +1135,13 @@ def main():
     except Exception as error:
         print(f"[WEBHOOK] tozalanmadi: {error}")
 
+    # Diagnostika: logda callback_query ko'rinmasa, tugmalar ishlamaydi.
+    try:
+        info = bot.get_webhook_info()
+        print(f"[TG] allowed_updates: {info.allowed_updates}")
+    except Exception as error:
+        print(f"[WEBHOOK INFO] {error}")
+
     try:
         BOT_USERNAME = bot.get_me().username or ""
         print(f"Bot: @{BOT_USERNAME}")
@@ -1153,7 +1175,11 @@ def main():
     # skip_pending=True: bot qayta ishga tushganda eski (masalan, tugallanmagan
     # ommaviy xabar) so'rovlar bajarilmaydi.
     bot.infinity_polling(
-        timeout=60, long_polling_timeout=60, skip_pending=True, none_stop=True
+        timeout=60,
+        long_polling_timeout=60,
+        skip_pending=True,
+        none_stop=True,
+        allowed_updates=ALLOWED_UPDATES,
     )
 
 
