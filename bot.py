@@ -364,19 +364,25 @@ def run_ffmpeg(command, timeout=900):
 def make_square_video(input_path, output_path):
     """To'rtburchak videoni dumaloq (video note) uchun kvadratga keltiradi.
 
+    sifat uchun: video kattalashtirilmaydi va 480px ga tushirilmaydi —
+    o'rtasidan asl o'lchamda kvadrat qirqiladi (1080px dan katta bo'lsa
+    faqat shunda kichraytiriladi), fps va ovoz asl holida qoladi.
     Telegram video note uchun: kvadrat, H.264, yuv420p, 1:1 SAR, <=60 soniya.
     """
+    filter_complex = (
+        "[0:v]crop='min(iw,ih)':'min(iw,ih)',"          # markazdan kvadrat, asl pikselda
+        "scale='min(1080,trunc(iw/2)*2)':-2:flags=lanczos,"  # faqat kerak bo'lsa kichraytirish
+        "setsar=1,format=yuv420p[v]"
+    )
     command = [
         FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
         "-t", "59",                                      # video note chegarasi
-        "-map", "0:v:0", "-map", "0:a:0?",               # audio bo'lmasa ham ishlaydi
-        "-vf",
-        "scale=480:480:force_original_aspect_ratio=increase,"
-        "crop=480:480,setsar=1,fps=30,format=yuv420p",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2",
-        "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "64k", "-ac", "1",
+        "-map", "[v]", "-map", "0:a:0?",                 # audio bo'lmasa ham ishlaydi
+        "-filter_complex", filter_complex,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-threads", "2",
+        "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
         output_path,
     ]
@@ -386,13 +392,18 @@ def make_square_video(input_path, output_path):
 def make_rectangle_video(input_path, output_path):
     """Dumaloq videoni oddiy to'rtburchak (16:9) videoga aylantiradi.
 
-    Kvadrat video o'rtaga qo'yiladi, chetlari blur (xira) fon bilan
-    to'ldiriladi — shu bilan video cho'zilib ketmaydi va qirqilmaydi.
+    Video asl o'lchamida o'rtaga qo'yiladi (kattalashtirilmaydi), chetlari
+    blur (xira) fon bilan to'ldiriladi — cho'zilmaydi, qirqilmaydi,
+    sifat yo'qolmaydi. Balandlik 1080px dan oshsa, butun video mutanosib
+    ravishda 1080px ga tushiriladi (fayl hajmi cheksiz o'smasligi uchun).
     """
     filter_complex = (
-        "[0:v]scale=854:480:force_original_aspect_ratio=increase,"
-        "crop=854:480,boxblur=20:2[bg];"
-        "[0:v]scale=-2:480,setsar=1[fg];"
+        # fon: asl balandlikdan 16:9 o'lcham, keyin xiralashtiriladi
+        "[0:v]split=2[bg0][fg0];"
+        "[bg0]scale=w='trunc(ih*16/9/2)*2':h='trunc(ih/2)*2',"
+        "boxblur=24:2,setsar=1[bg];"
+        # asosiy video: asl o'lchamda, faqat 1080px dan baland bo'lsa kichrayadi
+        "[fg0]scale=w=-2:h='min(trunc(ih/2)*2,1080)',setsar=1[fg];"
         "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
     )
     command = [
@@ -400,9 +411,9 @@ def make_rectangle_video(input_path, output_path):
         "-i", input_path,
         "-filter_complex", filter_complex,
         "-map", "[v]", "-map", "0:a:0?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-threads", "2",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-threads", "2",
+        "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
         output_path,
     ]
@@ -689,6 +700,11 @@ def conversion_job(message, kind, status_message_id):
         else:
             make_rectangle_video(input_path, output_path)
 
+        # Bot API orqali yuklash chegarasi 50 MB
+        output_mb = os.path.getsize(output_path) / (1024 * 1024)
+        if output_mb > 49:
+            raise RuntimeError("natija juda katta")
+
         if kind == "to_note":
             def send():
                 with open(output_path, "rb") as video_file:
@@ -696,7 +712,7 @@ def conversion_job(message, kind, status_message_id):
                         chat_id,
                         video_file,
                         reply_to_message_id=message.message_id,
-                        timeout=300,
+                        timeout=600,
                     )
         else:
             def send():
@@ -705,11 +721,9 @@ def conversion_job(message, kind, status_message_id):
                         chat_id,
                         video_file,
                         caption="🎥 Videongiz tayyor!",
-                        width=854,
-                        height=480,
                         supports_streaming=True,
                         reply_to_message_id=message.message_id,
-                        timeout=300,
+                        timeout=600,
                     )
 
         with_retry(send)
@@ -727,6 +741,11 @@ def conversion_job(message, kind, status_message_id):
         )
         if isinstance(error, RuntimeError) and "juda uzoq" in str(error):
             text = "❌ Video juda uzun, qayta ishlash to'xtatildi. Qisqaroq video yuboring."
+        elif isinstance(error, RuntimeError) and "juda katta" in str(error):
+            text = (
+                "❌ Natija hajmi 50 MB dan oshib ketdi (Telegram chegarasi).\n"
+                "Qisqaroq yoki kichikroq o'lchamdagi video yuboring."
+            )
         safe_edit(chat_id, status_message_id, text)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
