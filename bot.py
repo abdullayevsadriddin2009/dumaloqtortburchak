@@ -1,521 +1,1102 @@
+# -*- coding: utf-8 -*-
+"""
+Video konverter bot: dumaloq (video note) <-> to'rtburchak video.
+
+MUHIM: token va admin ID endi kodda emas, muhit o'zgaruvchilarida saqlanadi.
+Render -> Environment bo'limida quyidagilarni to'ldiring:
+
+    BOT_TOKEN    - 8357374445:AAFJfx3qYEc-fWVEZ-T-O3tILQ5UO74m6Lc          (majburiy)
+    ADMIN_ID     - 6377032074        (majburiy, botda /id orqali)
+    DB_FILE      - SQLite fayl yo'li                (ixtiyoriy)
+    MAX_INPUT_MB - qabul qilinadigan video hajmi    (ixtiyoriy, standart 20)
+    MAX_WORKERS  - bir vaqtda ishlaydigan ffmpeg    (ixtiyoriy, standart 2)
+    PORT         - health-check porti               (Render o'zi beradi)
+    FFMPEG_PATH  - ffmpeg yo'li                     (ixtiyoriy)
+"""
+
+import html
 import os
+import shutil
 import sqlite3
 import subprocess
+import sys
+import tempfile
 import threading
-import traceback
-import html
-import platform
 import time
-import socket  # Global tarmoq timeoutini sozlash uchun
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from telebot import TeleBot, types
-from telebot import apihelper
+import traceback
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# --- BOT SOZLAMALARI ---
-BOT_TOKEN = "8357374445:AAFJfx3qYEc-fWVEZ-T-O3tILQ5UO74m6Lc"  # Bot Token
-ADMIN_ID = 6377032074                                       # Admin ID
+from telebot import TeleBot, apihelper, types
+from telebot.apihelper import ApiTelegramException
 
-# Tarmoq ulanish xatoliklari va timeout muammolarini hal qilish uchun kutish vaqtlarini maksimal oshiramiz
-apihelper.CONNECT_TIMEOUT = 300
-apihelper.READ_TIMEOUT = 300
-socket.setdefaulttimeout(360)  # Global socket timeoutini 6 daqiqa qilib belgilaymiz (Sekin internet uchun xaloskor)
+# --- SOZLAMALAR (muhit o'zgaruvchilaridan) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Botni yaratish
-bot = TeleBot(BOT_TOKEN, threaded=True)
 
-# --- FFmpeg YO'LINI ANIQLASH (Windows va Linux/Render uchun) ---
-if platform.system() == "Windows":
-    FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
-else:
-    FFMPEG_PATH = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
-    if not os.path.exists(FFMPEG_PATH):
-        FFMPEG_PATH = "ffmpeg"
+def _env(name, default=""):
+    return (os.environ.get(name) or default).strip()
+
+
+def _env_int(name, default=0):
+    try:
+        return int(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
+BOT_TOKEN = _env("BOT_TOKEN")
+ADMIN_IDS = {
+    int(part)
+    for part in _env("ADMIN_ID").replace(";", ",").split(",")
+    if part.strip().lstrip("-").isdigit()
+}
+DB_FILE = _env("DB_FILE", os.path.join(BASE_DIR, "bot_database.db"))
+MAX_INPUT_MB = _env_int("MAX_INPUT_MB", 20)
+MAX_WORKERS = max(1, _env_int("MAX_WORKERS", 2))
+PORT = _env_int("PORT", 8080)
+STEP_TTL = 600          # admin amallari uchun kutish vaqti (soniya)
+BROADCAST_TTL = 900     # ommaviy xabarni tasdiqlash muddati (soniya)
+
+# Global socket timeout qo'yilmaydi: u health-check va SQLite bilan
+# to'qnashib, botning "osilib qolishiga" sabab bo'lardi.
+apihelper.CONNECT_TIMEOUT = 20
+apihelper.READ_TIMEOUT = 120
+
+bot = TeleBot(BOT_TOKEN or "0:invalid", threaded=True)
+BOT_USERNAME = ""
+
+# --- FFmpeg YO'LINI ANIQLASH ---
+def find_ffmpeg():
+    candidates = [
+        _env("FFMPEG_PATH"),
+        os.path.join(BASE_DIR, "ffmpeg_bin", "ffmpeg"),
+        os.path.join(BASE_DIR, "ffmpeg_bin", "ffmpeg.exe"),
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+FFMPEG_PATH = find_ffmpeg()
+
+
+def ffmpeg_ready():
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-version"], capture_output=True, timeout=30
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
 
 # --- MA'LUMOTLAR BAZASI (SQLite) ---
-DB_FILE = "bot_database.db"
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                blocked INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS channels (
-            channel_id TEXT PRIMARY KEY,
-            channel_name TEXT,
-            invite_link TEXT
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id TEXT PRIMARY KEY,
+                channel_name TEXT,
+                invite_link TEXT
+            )
+            """
         )
-    """)
-    conn.commit()
-    conn.close()
+        # Eski bazani yangilash (ustunlar yo'q bo'lsa qo'shiladi)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        for column, ddl in (
+            ("first_name", "TEXT"),
+            ("blocked", "INTEGER DEFAULT 0"),
+            ("created_at", "TEXT"),
+        ):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} {ddl}")
+
 
 init_db()
 
-def add_user(user_id, username):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
-    conn.commit()
-    conn.close()
 
-def get_all_users():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    users = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return users
+def add_user(user_id, username=None, first_name=None):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, blocked)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                blocked = 0
+            """,
+            (user_id, username, first_name),
+        )
+
+
+def get_user_ids():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM users WHERE COALESCE(blocked, 0) = 0"
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def count_users():
+    with db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def mark_user_blocked(user_id):
+    with db() as conn:
+        conn.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
+
 
 def get_channels():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT channel_id, channel_name, invite_link FROM channels")
-    channels = cursor.fetchall()
-    conn.close()
-    return channels
+    with db() as conn:
+        return conn.execute(
+            "SELECT channel_id, channel_name, invite_link FROM channels"
+        ).fetchall()
+
 
 def add_channel(channel_id, channel_name, invite_link):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO channels (channel_id, channel_name, invite_link) VALUES (?, ?, ?)",
-                   (channel_id, channel_name, invite_link))
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO channels (channel_id, channel_name, invite_link)
+            VALUES (?, ?, ?)
+            """,
+            (str(channel_id), channel_name, invite_link),
+        )
 
-def remove_channel(channel_id):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
-    conn.commit()
-    conn.close()
+
+def remove_channel(identifier):
+    """Kanalni ID, username yoki nomi bo'yicha o'chiradi. Topilsa True."""
+    identifier = (identifier or "").strip()
+    if not identifier:
+        return False
+    with db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM channels WHERE channel_id = ?", (identifier,)
+        )
+        if cursor.rowcount:
+            return True
+        rows = conn.execute(
+            "SELECT channel_id, channel_name FROM channels"
+        ).fetchall()
+        for channel_id, name in rows:
+            if (
+                channel_id.lstrip("-") == identifier.lstrip("-")
+                or (name or "").lower() == identifier.lower()
+            ):
+                conn.execute(
+                    "DELETE FROM channels WHERE channel_id = ?", (channel_id,)
+                )
+                return True
+    return False
+
 
 # --- MAJBURIY A'ZOLIK TEKSHIRUVI ---
 def check_subscription(user_id):
-    channels = get_channels()
-    if not channels:
-        return True
-
-    for channel_id, name, link in channels:
+    for channel_id, _name, _link in get_channels():
         try:
             member = bot.get_chat_member(channel_id, user_id)
-            if member.status in ['left', 'kicked']:
-                return False
-        except Exception:
+        except ApiTelegramException as error:
+            # Bot kanalda admin emas yoki kanal o'chirilgan: foydalanuvchini
+            # bloklab qo'ymaymiz, faqat logga yozamiz.
+            print(f"[OBUNA] {channel_id} tekshirilmadi: {error}")
             continue
+        except Exception as error:
+            print(f"[OBUNA] {channel_id} xato: {error}")
+            continue
+
+        status = getattr(member, "status", "left")
+        if status in ("left", "kicked"):
+            return False
+        if status == "restricted" and not getattr(member, "is_member", False):
+            return False
     return True
 
-def get_sub_keyboard(user_id):
-    keyboard = types.InlineKeyboardMarkup()
-    channels = get_channels()
-    for channel_id, name, link in channels:
-        keyboard.add(types.InlineKeyboardButton(text=name, url=link))
-    keyboard.add(types.InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub"))
+
+def get_sub_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for _channel_id, name, link in get_channels():
+        if link and link.startswith("http"):
+            keyboard.add(types.InlineKeyboardButton(text=name or "Kanal", url=link))
+        else:
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    text=name or "Kanal", callback_data="noop"
+                )
+            )
+    keyboard.add(
+        types.InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")
+    )
     return keyboard
 
-# --- FFmpeg TIZIMDA BORLIGINI TEKSHIRISH ---
-def is_ffmpeg_installed():
-    if os.path.exists(FFMPEG_PATH):
-        return True
+
+# --- YORDAMCHI FUNKSIYALAR ---
+def is_admin(user_id):
+    return bool(user_id) and user_id in ADMIN_IDS
+
+
+def safe_answer(call, text=None, show_alert=False):
+    """Callback'ga har doim javob beradi -> tugma 'aylanib qolmaydi'."""
     try:
-        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        bot.answer_callback_query(call.id, text=text, show_alert=show_alert)
+    except Exception:
+        pass
+
+
+def safe_edit(chat_id, message_id, text, reply_markup=None, parse_mode=None):
+    try:
+        bot.edit_message_text(
+            text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode
+        )
         return True
-    except FileNotFoundError:
+    except Exception:
         return False
 
-# --- YUQORI SIFATLI (HQ) FFmpeg FUNKSIYALARI ---
+
+def retry_after(error, default=5):
+    try:
+        parameters = (error.result_json or {}).get("parameters") or {}
+        return max(1, min(int(parameters.get("retry_after", default)), 60))
+    except Exception:
+        return default
+
+
+def with_retry(sender, attempts=3):
+    """Tarmoq / 429 / 5xx xatolarida qayta urinadi."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return sender()
+        except ApiTelegramException as error:
+            last_error = error
+            if error.error_code == 429:
+                time.sleep(retry_after(error))
+            elif error.error_code and error.error_code >= 500:
+                time.sleep(3 * (attempt + 1))
+            else:
+                raise
+        except (ConnectionError, OSError, TimeoutError) as error:
+            last_error = error
+            time.sleep(3 * (attempt + 1))
+    raise last_error
+
+
+# --- FFmpeg FUNKSIYALARI ---
+def run_ffmpeg(command, timeout=900):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("FFmpeg juda uzoq ishladi va to'xtatildi.")
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg topilmadi.")
+
+    if result.returncode != 0:
+        details = (result.stderr or "").strip().splitlines()[-6:]
+        print("[FFMPEG] " + " | ".join(details))
+        raise RuntimeError("FFmpeg videoni qayta ishlay olmadi.")
+
+
 def make_square_video(input_path, output_path):
-    """
-    Sifatni mutlaqo yo'qotmagan holda videoni dumaloq qilish.
-    '-preset veryfast' va '-movflags +faststart' qo'llandi. 
-    Bu vizual sifatni mutlaqo o'zgartirmaydi (CRF 20 saqlangan), 
-    lekin fayl hajmini kichraytiradi va Telegram tezroq qabul qilishi uchun metadata indeksini boshiga ko'chiradi!
+    """To'rtburchak videoni dumaloq (video note) uchun kvadratga keltiradi.
+
+    Telegram video note uchun: kvadrat, H.264, yuv420p, 1:1 SAR, <=60 soniya.
     """
     command = [
-        FFMPEG_PATH, '-y', '-i', input_path,
-        '-t', '60',                 # Maksimal 60 soniya
-        '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480", # Standart HD dumaloq video o'lchami
-        '-c:v', 'libx264', 
-        '-preset', 'veryfast',      # Yuqori tezlik va yaxshi siqish nisbati
-        '-crf', '20',               # Asl tiniqlik darajasi (juda yuqori sifat)
-        '-threads', '2',
-        '-movflags', '+faststart',  # Telegram tezda yuklab olishni boshlashi uchun metadata indeksini boshiga o'tkazish
-        '-profile:v', 'baseline', '-level', '3.0', '-pix_fmt', 'yuv420p',
-        '-ac', '1',                 # Audioni mono qilish (Render yuklash tezligini tejaydi)
-        '-c:a', 'aac', '-b:a', '64k',  # Yuqori va toza audio sifati (64kbps)
-        '-strict', '-2',
-        output_path
+        FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-t", "59",                                      # video note chegarasi
+        "-map", "0:v:0", "-map", "0:a:0?",               # audio bo'lmasa ham ishlaydi
+        "-vf",
+        "scale=480:480:force_original_aspect_ratio=increase,"
+        "crop=480:480,setsar=1,fps=30,format=yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2",
+        "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "64k", "-ac", "1",
+        "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
+        output_path,
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"FFmpeg xatosi: {result.stderr}")
+    run_ffmpeg(command)
 
-def make_normal_video(input_path, output_path):
+
+def make_rectangle_video(input_path, output_path):
+    """Dumaloq videoni oddiy to'rtburchak (16:9) videoga aylantiradi.
+
+    Kvadrat video o'rtaga qo'yiladi, chetlari blur (xira) fon bilan
+    to'ldiriladi — shu bilan video cho'zilib ketmaydi va qirqilmaydi.
     """
-    Dumaloq videoni tiniq sifatda oddiy videoga o'tkazish.
-    """
+    filter_complex = (
+        "[0:v]scale=854:480:force_original_aspect_ratio=increase,"
+        "crop=854:480,boxblur=20:2[bg];"
+        "[0:v]scale=-2:480,setsar=1[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
+    )
     command = [
-        FFMPEG_PATH, '-y', '-i', input_path,
-        '-c:v', 'libx264', 
-        '-preset', 'veryfast', 
-        '-crf', '20',
-        '-threads', '2',
-        '-movflags', '+faststart',
-        '-pix_fmt', 'yuv420p',
-        '-ac', '1', '-c:a', 'aac', '-b:a', '64k',
-        output_path
+        FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", "0:a:0?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-threads", "2",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+        "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
+        output_path,
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"FFmpeg xatosi: {result.stderr}")
+    run_ffmpeg(command)
 
-# --- ADMIN PANEL KLAVIATURALARI ---
+
+# --- KO'P VAZIFALI ISHCHI (bir vaqtda cheklangan miqdorda konvertatsiya) ---
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="convert")
+busy_users = set()
+busy_lock = threading.Lock()
+
+
+def acquire_user(user_id):
+    with busy_lock:
+        if user_id in busy_users:
+            return False
+        busy_users.add(user_id)
+        return True
+
+
+def release_user(user_id):
+    with busy_lock:
+        busy_users.discard(user_id)
+
+
+# --- ADMIN KLAVIATURALARI ---
 def get_admin_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         types.InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats"),
-        types.InlineKeyboardButton(text="📢 Ommaviy xabar", callback_data="admin_broadcast")
+        types.InlineKeyboardButton(text="📢 Ommaviy xabar", callback_data="admin_broadcast"),
     )
     keyboard.add(
         types.InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="admin_add_channel"),
-        types.InlineKeyboardButton(text="➖ Kanalni o'chirish", callback_data="admin_del_channel")
+        types.InlineKeyboardButton(text="➖ Kanalni o'chirish", callback_data="admin_del_channel"),
     )
-    keyboard.add(types.InlineKeyboardButton(text="📋 Kanallar ro'yxati", callback_data="admin_list_channels"))
+    keyboard.add(
+        types.InlineKeyboardButton(text="📋 Kanallar ro'yxati", callback_data="admin_list_channels")
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(text="🔄 Yangilash", callback_data="admin_panel"),
+        types.InlineKeyboardButton(text="❌ Yopish", callback_data="admin_close"),
+    )
     return keyboard
 
-def get_admin_reply_keyboard():
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    keyboard.add(types.KeyboardButton("⚙️ Admin Panel"))
-    return keyboard
 
-# --- HANDLERS ---
+def admin_panel_text():
+    return (
+        "⚙️ <b>Admin panel</b>\n\n"
+        f"👥 Foydalanuvchilar: <b>{count_users()}</b> ta\n"
+        f"📢 Majburiy kanallar: <b>{len(get_channels())}</b> ta\n\n"
+        "Kerakli bo'limni tanlang:"
+    )
 
-@bot.message_handler(commands=['start'])
+
+INSTRUCTIONS = (
+    "👋 <b>Salom! Video konverter botga xush kelibsiz!</b>\n\n"
+    "Men avtomatik rejimda ishlayman:\n"
+    "1️⃣ Menga oddiy <b>to'rtburchak video</b> yuboring ➡️ uni <b>dumaloq video</b> qilib beraman.\n"
+    "2️⃣ Menga <b>dumaloq video</b> yuboring ➡️ uni to'liq ekranli <b>to'rtburchak videoga</b> aylantiraman.\n\n"
+    "⚡️ Shunchaki videoni yuboring va natijani oling!"
+)
+
+
+# --- HANDLERS: START ---
+@bot.message_handler(commands=["start"], chat_types=["private"])
 def start_handler(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "No Username"
-    add_user(user_id, username)
+    user = message.from_user
+    add_user(user.id, user.username, user.first_name)
 
-    if not check_subscription(user_id):
+    if not check_subscription(user.id):
         bot.send_message(
-            message.chat.id, 
-            "👋 Salom! Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:", 
-            reply_markup=get_sub_keyboard(user_id)
+            message.chat.id,
+            "👋 Salom! Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:",
+            reply_markup=get_sub_keyboard(),
         )
         return
 
-    instructions = (
-        "👋 <b>Salom! Video Konverter botga xush kelibsiz!</b>\n\n"
-        "Men avtomatik rejimda ishlayman:\n"
-        "1️⃣ Menga oddiy <b>To'rtburchak video</b> yuboring ➡️ Men uni <b>Dumaloq video (Teleskop)</b> qilib beraman.\n"
-        "2️⃣ Menga <b>Dumaloq video</b> yuboring ➡️ Men uni oddiy yuklab olinadigan <b>To'rtburchak video</b> qilib beraman.\n\n"
-        "⚡️ Shunchaki videoni yuboring va natijani oling!"
+    if is_admin(user.id):
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(
+            types.InlineKeyboardButton(text="⚙️ Admin panel", callback_data="admin_panel")
+        )
+        bot.send_message(
+            message.chat.id, INSTRUCTIONS, parse_mode="HTML", reply_markup=keyboard
+        )
+    else:
+        bot.send_message(message.chat.id, INSTRUCTIONS, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["id"])
+def id_handler(message):
+    bot.reply_to(
+        message,
+        f"🆔 Sizning Telegram ID: <code>{message.from_user.id}</code>\n"
+        f"💬 Chat ID: <code>{message.chat.id}</code>",
+        parse_mode="HTML",
     )
 
-    if user_id == ADMIN_ID:
-        bot.send_message(message.chat.id, instructions, parse_mode="HTML", reply_markup=get_admin_reply_keyboard())
-    else:
-        bot.send_message(message.chat.id, instructions, parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
 
-@bot.message_handler(commands=['admin'])
+@bot.message_handler(commands=["admin"], chat_types=["private"])
 def admin_handler(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
-    bot.send_message(message.chat.id, "⚙️ <b>Admin Panelga xush kelibsiz!</b>\nKerakli bo'limni tanlang:",
-                     reply_markup=get_admin_keyboard(), parse_mode="HTML")
+    clear_admin_steps(message.from_user.id, message.chat.id)
+    bot.send_message(
+        message.chat.id,
+        admin_panel_text(),
+        reply_markup=get_admin_keyboard(),
+        parse_mode="HTML",
+    )
 
-@bot.message_handler(func=lambda message: message.text == "⚙️ Admin Panel")
-def admin_button_click_handler(message):
-    if message.from_user.id != ADMIN_ID:
+
+@bot.message_handler(commands=["cancel"])
+def cancel_handler(message):
+    if not is_admin(message.from_user.id):
         return
-    bot.send_message(message.chat.id, "⚙️ <b>Admin Panelga xush kelibsiz!</b>\nKerakli bo'limni tanlang:",
-                     reply_markup=get_admin_keyboard(), parse_mode="HTML")
+    clear_admin_steps(message.from_user.id, message.chat.id)
+    bot.send_message(message.chat.id, "✅ Amal bekor qilindi.", reply_markup=get_admin_keyboard())
 
-# --- MAIN VIDEO CONVERSION LOGIC ---
 
-@bot.message_handler(content_types=['video'])
+# --- ADMIN "KEYINGI QADAM" BOSHQARUVI ---
+admin_steps = {}
+pending_broadcast = {}
+consumed_messages = deque(maxlen=100)   # admin amali "yeb qo'ygan" xabarlar
+
+
+def set_admin_step(user_id, step):
+    admin_steps[user_id] = (step, time.time())
+
+
+def clear_admin_steps(user_id, chat_id=None):
+    admin_steps.pop(user_id, None)
+    pending_broadcast.pop(user_id, None)
+    if chat_id is not None:
+        try:
+            bot.clear_step_handler_by_chat_id(chat_id)
+        except Exception:
+            pass
+
+
+def take_admin_step(message, expected):
+    """Faqat admin va faqat kutilgan qadam bo'lsa True qaytaradi."""
+    user = getattr(message, "from_user", None)
+    if user is None or not is_admin(user.id):
+        return False
+    current = admin_steps.pop(user.id, None)
+    if not current or current[0] != expected:
+        return False
+    if time.time() - current[1] > STEP_TTL:
+        bot.send_message(message.chat.id, "⌛️ Amal muddati tugadi, qaytadan boshlang.")
+        return False
+    # Telebot next-step handler bilan birga oddiy handler'lar ham ishga
+    # tushadi: bu xabar konvertatsiyaga yoki boshqa amalga tushmasligi uchun
+    # uni "band" deb belgilaymiz.
+    consumed_messages.append((message.chat.id, message.message_id))
+    return True
+
+
+def register_admin_step(chat_id, user_id, step, handler):
+    clear_admin_steps(user_id, chat_id)
+    set_admin_step(user_id, step)
+    prompt = bot.send_message(chat_id, STEP_PROMPTS[step], reply_markup=types.ForceReply())
+    bot.register_next_step_handler(prompt, handler)
+
+
+STEP_PROMPTS = {
+    "broadcast": (
+        "📝 <b>Ommaviy xabar</b>\n\n"
+        "Yubormoqchi bo'lgan postni yoki matnni yuboring.\n"
+        "Bekor qilish uchun /cancel"
+    ),
+    "add_channel": (
+        "📢 <b>Yangi kanal qo'shish</b>\n\n"
+        "1️⃣ Kanaldagi istalgan postni botga <b>forward</b> qiling (tavsiya etiladi), yoki\n"
+        "2️⃣ Kanal username'ini yuboring: <code>@kanal</code>\n\n"
+        "⚠️ Bot kanalda <b>administrator</b> bo'lishi shart.\n"
+        "Bekor qilish uchun /cancel"
+    ),
+    "del_channel": (
+        "➖ <b>Kanalni o'chirish</b>\n\n"
+        "Kanalning ID, username yoki nomini yuboring.\n"
+        "Bekor qilish uchun /cancel"
+    ),
+}
+
+
+# --- VIDEO KONVERTATSIYA ---
+@bot.message_handler(content_types=["video"], chat_types=["private"])
 def handle_normal_video(message):
-    user_id = message.from_user.id
-    if not check_subscription(user_id):
-        bot.send_message(message.chat.id, "❌ Botdan foydalanish uchun kanallarga a'zo bo'ling:", reply_markup=get_sub_keyboard(user_id))
-        return
+    start_conversion(message, "to_note")
 
-    if not is_ffmpeg_installed():
-        bot.reply_to(message, "❌ Tizimda FFmpeg dasturi topilmadi! Iltimos, server sozlamalarini tekshiring.")
-        return
 
-    if message.video.file_size > 20 * 1024 * 1024:
-        bot.reply_to(message, "⚠️ Video hajmi juda katta! 20 MB gacha video yuboring.")
-        return
-
-    status_msg = bot.reply_to(message, "⏳ Videongiz qabul qilindi. Dumaloq shaklga keltirilmoqda, iltimos kuting...")
-
-    def process():
-        input_name = f"in_{message.chat.id}_{message.message_id}.mp4"
-        output_name = f"out_{message.chat.id}_{message.message_id}.mp4"
-        try:
-            # Faylni serverga yuklab olish
-            file_info = bot.get_file(message.video.file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
-            
-            with open(input_name, 'wb') as new_file:
-                new_file.write(downloaded_file)
-            
-            # FFmpeg orqali sifatli konvertatsiya qilish
-            make_square_video(input_name, output_name)
-            
-            # Telegram-ga qayta yuborish (Xatolikni oldini olish uchun xavfsiz Retry mexanizmi bilan)
-            success = False
-            for attempt in range(3): # Jami 3 marta urinib ko'radi
-                try:
-                    with open(output_name, 'rb') as video_note:
-                        # Timeout vaqtini 5 daqiqa (300 soniya) qildik!
-                        bot.send_video_note(message.chat.id, video_note, reply_to_message_id=message.message_id, timeout=300)
-                    success = True
-                    break
-                except Exception as upload_error:
-                    print(f"[URINISH {attempt+1} MUVAFFAQIYATSIZ]: {str(upload_error)}")
-                    time.sleep(3) # Keyingi urinishdan oldin 3 soniya kutadi
-            
-            if success:
-                bot.delete_message(message.chat.id, status_msg.message_id)
-            else:
-                raise Exception("Telegram serveriga videoni yuklashda bir necha bor urinish muvaffaqiyatsiz tugadi (Tarmoq yuklash vaqti tugadi).")
-            
-        except Exception as e:
-            traceback.print_exc()
-            safe_error = html.escape(str(e)[:120])
-            bot.edit_message_text(f"❌ Videoni qayta ishlashda xatolik yuz berdi.\nBatafsil: {safe_error}", 
-                                  message.chat.id, status_msg.message_id)
-        finally:
-            if os.path.exists(input_name): os.remove(input_name)
-            if os.path.exists(output_name): os.remove(output_name)
-
-    threading.Thread(target=process).start()
-
-@bot.message_handler(content_types=['video_note'])
+@bot.message_handler(content_types=["video_note"], chat_types=["private"])
 def handle_round_video(message):
+    start_conversion(message, "to_video")
+
+
+@bot.message_handler(
+    content_types=["video", "video_note"],
+    func=lambda m: m.chat.type != "private",
+)
+def handle_group_media(message):
+    bot.send_message(
+        message.chat.id,
+        "🤖 Men faqat shaxsiy chatda ishlayman."
+        + (f" Menga shu yerga yozing: @{BOT_USERNAME}" if BOT_USERNAME else ""),
+    )
+
+
+def start_conversion(message, kind):
+    user = message.from_user
+
+    # Admin panel amali uchun yuborilgan xabar (masalan, reklama posti) hech
+    # qachon konvertatsiyaga tushmasligi kerak.
+    if (message.chat.id, message.message_id) in consumed_messages:
+        return
+
+    add_user(user.id, user.username, user.first_name)
+
+    if not check_subscription(user.id):
+        bot.send_message(
+            message.chat.id,
+            "❌ Botdan foydalanish uchun kanallarga a'zo bo'ling:",
+            reply_markup=get_sub_keyboard(),
+        )
+        return
+
+    if not ffmpeg_ready():
+        bot.send_message(
+            message.chat.id, "❌ Serverda FFmpeg topilmadi. Admin bilan bog'laning."
+        )
+        return
+
+    media = message.video if kind == "to_note" else message.video_note
+    size = getattr(media, "file_size", 0) or 0
+    if size > MAX_INPUT_MB * 1024 * 1024:
+        bot.reply_to(
+            message,
+            f"⚠️ Video juda katta ({size / 1024 / 1024:.1f} MB). "
+            f"Telegram botlar {MAX_INPUT_MB} MB gacha videoni yuklay oladi.",
+        )
+        return
+
+    if not acquire_user(user.id):
+        bot.reply_to(
+            message, "⏳ Oldingi videongiz hali tayyorlanmoqda. Iltimos, kuting."
+        )
+        return
+
+    try:
+        status = bot.reply_to(
+            message,
+            "⏳ Video qabul qilindi, qayta ishlanmoqda..."
+            if kind == "to_note"
+            else "⏳ Dumaloq video qabul qilindi, to'rtburchak videoga o'tkazilmoqda...",
+        )
+        executor.submit(conversion_job, message, kind, status.message_id)
+    except Exception:
+        release_user(user.id)
+        raise
+
+
+def conversion_job(message, kind, status_message_id):
+    chat_id = message.chat.id
     user_id = message.from_user.id
-    if not check_subscription(user_id):
-        bot.send_message(message.chat.id, "❌ Botdan foydalanish uchun kanallarga a'zo bo'ling:", reply_markup=get_sub_keyboard(user_id))
-        return
+    media = message.video if kind == "to_note" else message.video_note
+    workdir = tempfile.mkdtemp(prefix="conv_")
+    input_path = os.path.join(workdir, "input.mp4")
+    output_path = os.path.join(workdir, "output.mp4")
 
-    if not is_ffmpeg_installed():
-        bot.reply_to(message, "❌ Tizimda FFmpeg dasturi topilmadi!")
-        return
+    try:
+        file_info = bot.get_file(media.file_id)
+        with open(input_path, "wb") as target:
+            target.write(bot.download_file(file_info.file_path))
 
-    status_msg = bot.reply_to(message, "⏳ Dumaloq video qabul qilindi. Oddiy video formatiga o'tkazilmoqda...")
-
-    def process():
-        input_name = f"in_{message.chat.id}_{message.message_id}.mp4"
-        output_name = f"out_{message.chat.id}_{message.message_id}.mp4"
         try:
-            file_info = bot.get_file(message.video_note.file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
-            
-            with open(input_name, 'wb') as new_file:
-                new_file.write(downloaded_file)
-            
-            make_normal_video(input_name, output_name)
-            
-            # Telegram-ga qayta yuborish (Xavfsiz retry bilan)
-            success = False
-            for attempt in range(3):
-                try:
-                    with open(output_name, 'rb') as video:
-                        bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id, caption="🎥 Videongiz tayyor!", timeout=300)
-                    success = True
-                    break
-                except Exception as upload_error:
-                    print(f"[URINISH {attempt+1} MUVAFFAQIYATSIZ]: {str(upload_error)}")
-                    time.sleep(3)
+            bot.send_chat_action(chat_id, "record_video_note" if kind == "to_note" else "upload_video")
+        except Exception:
+            pass
 
-            if success:
-                bot.delete_message(message.chat.id, status_msg.message_id)
-            else:
-                raise Exception("Telegram serveriga yuklashda vaqt tugadi.")
-            
-        except Exception as e:
-            traceback.print_exc()
-            safe_error = html.escape(str(e)[:120])
-            bot.edit_message_text(f"❌ Qayta ishlashda xatolik yuz berdi.\nBatafsil: {safe_error}", 
-                                  message.chat.id, status_msg.message_id)
-        finally:
-            if os.path.exists(input_name): os.remove(input_name)
-            if os.path.exists(output_name): os.remove(output_name)
+        if kind == "to_note":
+            make_square_video(input_path, output_path)
+        else:
+            make_rectangle_video(input_path, output_path)
 
-    threading.Thread(target=process).start()
+        if kind == "to_note":
+            def send():
+                with open(output_path, "rb") as video_file:
+                    return bot.send_video_note(
+                        chat_id,
+                        video_file,
+                        reply_to_message_id=message.message_id,
+                        timeout=300,
+                    )
+        else:
+            def send():
+                with open(output_path, "rb") as video_file:
+                    return bot.send_video(
+                        chat_id,
+                        video_file,
+                        caption="🎥 Videongiz tayyor!",
+                        width=854,
+                        height=480,
+                        supports_streaming=True,
+                        reply_to_message_id=message.message_id,
+                        timeout=300,
+                    )
 
-# --- CALLBACKS & ADMIN PANEL ---
+        with_retry(send)
 
+        try:
+            bot.delete_message(chat_id, status_message_id)
+        except Exception:
+            pass
+
+    except Exception as error:
+        traceback.print_exc()
+        text = (
+            "❌ Videoni qayta ishlashda xatolik yuz berdi.\n"
+            "Iltimos, boshqa video bilan qayta urinib ko'ring."
+        )
+        if isinstance(error, RuntimeError) and "juda uzoq" in str(error):
+            text = "❌ Video juda uzun, qayta ishlash to'xtatildi. Qisqaroq video yuboring."
+        safe_edit(chat_id, status_message_id, text)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        release_user(user_id)
+
+
+# --- CALLBACK'LAR (ADMIN PANEL) ---
 @bot.callback_query_handler(func=lambda call: True)
 def callback_listener(call):
+    try:
+        handle_callback(call)
+    except Exception:
+        traceback.print_exc()
+        safe_answer(call, "❌ Xatolik yuz berdi, qayta urinib ko'ring.", show_alert=True)
+
+
+def handle_callback(call):
+    data = call.data or ""
     user_id = call.from_user.id
 
-    if call.data == "check_sub":
+    if data == "check_sub":
         if check_subscription(user_id):
-            bot.answer_callback_query(call.id, "✅ Rahmat! Barcha kanallarga a'zo bo'ldingiz.", show_alert=True)
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-            instructions = (
+            safe_answer(call, "✅ Rahmat! Barcha kanallarga a'zo bo'ldingiz.")
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            bot.send_message(
+                call.message.chat.id,
                 "👋 <b>Siz muvaffaqiyatli ro'yxatdan o'tdingiz!</b>\n\n"
-                "Menga oddiy video yoki dumaloq video yuboring, men uni avtomatik o'zgartirib beraman!"
+                "Menga oddiy video yoki dumaloq video yuboring — avtomatik o'zgartiraman!",
+                parse_mode="HTML",
             )
-            bot.send_message(call.message.chat.id, instructions, parse_mode="HTML")
         else:
-            bot.answer_callback_query(call.id, "❌ Hali hamma kanallarga a'zo bo'lmadingiz!", show_alert=True)
+            safe_answer(call, "❌ Hali hamma kanallarga a'zo bo'lmadingiz!", show_alert=True)
+        return
 
-    elif user_id == ADMIN_ID:
-        if call.data == "admin_stats":
-            users_count = len(get_all_users())
-            channels = get_channels()
-            text = f"📊 <b>Bot Statistikasi:</b>\n\n👥 Foydalanuvchilar soni: {users_count} ta\n📢 Majburiy kanallar soni: {len(channels)} ta"
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, 
-                                  reply_markup=get_admin_keyboard(), parse_mode="HTML")
-            
-        elif call.data == "admin_broadcast":
-            msg = bot.send_message(call.message.chat.id, "📝 Ommaviy xabar matnini yuboring:")
-            bot.register_next_step_handler(msg, process_broadcast)
-            
-        elif call.data == "admin_add_channel":
-            msg = bot.send_message(call.message.chat.id, 
-                                   "📢 <b>Yangi kanal qo'shish</b>\n\n"
-                                   "Ushbu usullardan biri orqali kanal qo'shishingiz mumkin:\n\n"
-                                   "1️⃣ <b>Yo'naltirish (Tavsiya etiladi):</b> Kanaldagi istalgan bir postni botga <b>Forward (yo'naltirib)</b> yuboring!\n\n"
-                                   "2️⃣ <b>Username yozish:</b> Kanal username yoki havolasini yuboring.\n"
-                                   "   <i>Misol: @abduIIayev_09 yoki https://t.me/abduIIayev_09</i>\n\n"
-                                   "⚠️ *Bot ushbu kanalda administrator bo'lishi shart!*", parse_mode="HTML")
-            bot.register_next_step_handler(msg, process_add_channel)
-            
-        elif call.data == "admin_del_channel":
-            msg = bot.send_message(call.message.chat.id, "O'chirmoqchi bo'lgan kanalingizning **Kanal ID yoki Username** ini yuboring:")
-            bot.register_next_step_handler(msg, process_del_channel)
-            
-        elif call.data == "admin_list_channels":
-            channels = get_channels()
-            if not channels:
-                bot.send_message(call.message.chat.id, "Sizda majburiy a'zolik kanallari sozlanmagan.")
-                return
-            text = "📋 <b>Majburiy a'zolik kanallari ro'yxati:</b>\n\n"
-            for cid, name, link in channels:
-                text += f"▪️ <b>{html.escape(name)}</b>\n   └ ID: <code>{html.escape(cid)}</code>\n   └ Havola: {html.escape(link)}\n\n"
-            bot.send_message(call.message.chat.id, text, parse_mode="HTML")
+    if data == "noop":
+        safe_answer(call, "Bu kanal uchun havola sozlanmagan.")
+        return
 
-# --- ADMIN FUNKSIYALARI ---
+    if not is_admin(user_id):
+        safe_answer(call, "⛔ Bu bo'lim faqat admin uchun.")
+        return
 
-def process_broadcast(message):
-    users = get_all_users()
-    sent = 0
-    failed = 0
-    status = bot.send_message(message.chat.id, "🚀 Xabar yuborilmoqda, iltimos kuting...")
-    for uid in users:
+    # Admin uchun callback har doim darhol yopiladi (tugma "aylanib" qolmaydi)
+    safe_answer(call)
+    chat_id = call.message.chat.id
+
+    if data == "admin_panel":
+        safe_edit(chat_id, call.message.message_id, admin_panel_text(),
+                  reply_markup=get_admin_keyboard(), parse_mode="HTML")
+
+    elif data == "admin_close":
+        clear_admin_steps(user_id, chat_id)
         try:
-            bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
-            sent += 1
+            bot.delete_message(chat_id, call.message.message_id)
         except Exception:
-            failed += 1
-    bot.edit_message_text(f"✅ <b>Ommaviy xabar yakunlandi!</b>\n\n📥 Muvaffaqiyatli: {sent} ta\n❌ Yetib bormadi: {failed} ta", 
-                          message.chat.id, status.message_id, parse_mode="HTML")
+            pass
 
-def process_add_channel(message):
-    try:
-        if message.forward_from_chat and message.forward_from_chat.type == "channel":
-            chat = message.forward_from_chat
-            channel_id = str(chat.id)
-            channel_name = chat.title
-            invite_link = f"https://t.me/{chat.username}" if chat.username else "https://t.me/"
-            
-            add_channel(channel_id, channel_name, invite_link)
-            
-            safe_name = html.escape(channel_name)
-            bot.send_message(message.chat.id, f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n📢 Nomi: {safe_name}", parse_mode="HTML")
-            return
+    elif data == "admin_stats":
+        blocked = count_users() - len(get_user_ids())
+        safe_edit(
+            chat_id,
+            call.message.message_id,
+            "📊 <b>Bot statistikasi</b>\n\n"
+            f"👥 Foydalanuvchilar: <b>{count_users()}</b> ta\n"
+            f"🚫 Botni bloklaganlar: <b>{blocked}</b> ta\n"
+            f"📢 Majburiy kanallar: <b>{len(get_channels())}</b> ta",
+            reply_markup=get_admin_keyboard(),
+            parse_mode="HTML",
+        )
 
-        if not message.text:
-            bot.send_message(message.chat.id, "❌ Iltimos, kanal username'ini yuboring yoki biror postni yo'naltiring!")
-            return
-
-        text = message.text.strip()
-        
-        if "|" in text:
-            parts = text.split("|")
-            channel_id = parts[0].strip()
-            channel_name = parts[1].strip()
-            invite_link = parts[2].strip()
+    elif data == "admin_list_channels":
+        channels = get_channels()
+        if not channels:
+            text = "📋 Majburiy a'zolik kanallari sozlanmagan."
         else:
-            channel_id = text
-            if "t.me/" in channel_id:
-                parts = channel_id.split("t.me/")
-                username_part = parts[1].split("/")[0].split("?")[0].strip()
-                if not username_part.startswith("+") and not username_part.startswith("joinchat"):
-                    channel_id = "@" + username_part
-            
-            if not channel_id.startswith("@") and not channel_id.startswith("-"):
-                if not channel_id.replace("-", "").isdigit():
-                    channel_id = "@" + channel_id
-            
-            chat = bot.get_chat(channel_id)
-            channel_name = chat.title
-            invite_link = f"https://t.me/{chat.username}" if chat.username else "https://t.me/"
+            text = "📋 <b>Majburiy a'zolik kanallari:</b>\n\n"
+            for channel_id, name, link in channels:
+                text += (
+                    f"▪️ <b>{html.escape(name or '-')}</b>\n"
+                    f"   └ ID: <code>{html.escape(str(channel_id))}</code>\n"
+                    f"   └ Havola: {html.escape(link or '-')}\n\n"
+                )
+        safe_edit(chat_id, call.message.message_id, text,
+                  reply_markup=get_admin_keyboard(), parse_mode="HTML")
+
+    elif data == "admin_broadcast":
+        register_admin_step(chat_id, user_id, "broadcast", on_broadcast_content)
+
+    elif data == "admin_add_channel":
+        register_admin_step(chat_id, user_id, "add_channel", on_add_channel)
+
+    elif data == "admin_del_channel":
+        register_admin_step(chat_id, user_id, "del_channel", on_del_channel)
+
+    elif data == "bc_send":
+        start_broadcast(call)
+    elif data == "bc_cancel":
+        pending_broadcast.pop(user_id, None)
+        safe_edit(chat_id, call.message.message_id, "❌ Ommaviy xabar bekor qilindi.")
+    else:
+        safe_answer(call, "Noma'lum buyruq.")
+
+
+# --- OMMAVIY XABAR (tasdiqlash bilan) ---
+def on_broadcast_content(message):
+    if not take_admin_step(message, "broadcast"):
+        return
+
+    pending_broadcast[message.from_user.id] = {
+        "chat_id": message.chat.id,
+        "message_id": message.message_id,
+        "time": time.time(),
+    }
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton(text="✅ Yuborish", callback_data="bc_send"),
+        types.InlineKeyboardButton(text="❌ Bekor qilish", callback_data="bc_cancel"),
+    )
+    bot.send_message(
+        message.chat.id,
+        f"👥 Ushbu xabar <b>{len(get_user_ids())}</b> ta foydalanuvchiga yuboriladi.\n\n"
+        "Tasdiqlaysizmi?",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+def start_broadcast(call):
+    user_id = call.from_user.id
+    data = pending_broadcast.pop(user_id, None)
+    if not data or time.time() - data["time"] > BROADCAST_TTL:
+        safe_edit(call.message.chat.id, call.message.message_id,
+                  "⌛️ Tasdiqlash muddati tugadi. Qaytadan boshlang: /admin")
+        return
+
+    status = bot.send_message(call.message.chat.id, "🚀 Xabar yuborilmoqda...")
+    threading.Thread(
+        target=broadcast_worker,
+        args=(call.message.chat.id, status.message_id, data["chat_id"], data["message_id"]),
+        daemon=True,
+    ).start()
+
+
+def broadcast_worker(chat_id, status_id, from_chat_id, message_id):
+    users = get_user_ids()
+    total = len(users)
+    sent = failed = 0
+
+    for index, user_id in enumerate(users, start=1):
+        try:
+            with_retry(
+                lambda uid=user_id: bot.copy_message(uid, from_chat_id, message_id, timeout=30)
+            )
+            sent += 1
+        except ApiTelegramException as error:
+            failed += 1
+            description = (error.description or "").lower()
+            if error.error_code == 403 or "blocked" in description or "deactivated" in description:
+                mark_user_blocked(user_id)
+        except Exception as error:
+            failed += 1
+            print(f"[BROADCAST] {user_id}: {error}")
+
+        time.sleep(0.05)  # Telegram limitiga tushib qolmaslik uchun
+        if index % 25 == 0:
+            safe_edit(chat_id, status_id, f"🚀 Yuborilmoqda... {index}/{total}")
+
+    safe_edit(
+        chat_id,
+        status_id,
+        "✅ <b>Ommaviy xabar yakunlandi</b>\n\n"
+        f"📥 Yetkazildi: <b>{sent}</b> ta\n"
+        f"❌ Yetib bormadi: <b>{failed}</b> ta",
+        reply_markup=get_admin_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# --- KANAL QO'SHISH / O'CHIRISH ---
+def channel_from_message(message):
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is not None and getattr(chat, "type", None) == "channel":
+        return chat
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None)
+        if chat is not None and getattr(chat, "type", None) == "channel":
+            return chat
+    return None
+
+
+def normalize_channel_reference(text):
+    text = (text or "").strip()
+    if "t.me/" in text:
+        part = text.split("t.me/")[1].split("/")[0].split("?")[0].strip()
+        if part and not part.startswith("+") and not part.startswith("joinchat"):
+            return "@" + part
+    if text and not text.startswith("@") and not text.lstrip("-").isdigit():
+        return "@" + text
+    return text
+
+
+def on_add_channel(message):
+    if not take_admin_step(message, "add_channel"):
+        return
+
+    try:
+        chat = channel_from_message(message)
+        channel_name = None
+        invite_link = None
+
+        if chat is not None:
             channel_id = str(chat.id)
+            channel_name = chat.title
+            if getattr(chat, "username", None):
+                invite_link = f"https://t.me/{chat.username}"
+        else:
+            if not message.text:
+                bot.send_message(
+                    message.chat.id,
+                    "❌ Kanal postini forward qiling yoki username yuboring.",
+                )
+                return
+
+            text = message.text.strip()
+            if "|" in text:
+                parts = [part.strip() for part in text.split("|")]
+                channel_id = parts[0]
+                channel_name = parts[1] if len(parts) > 1 else None
+                invite_link = parts[2] if len(parts) > 2 else None
+            else:
+                channel_id = normalize_channel_reference(text)
+
+            chat = bot.get_chat(channel_id)
+            channel_id = str(chat.id)
+            channel_name = chat.title
+            if getattr(chat, "username", None):
+                invite_link = f"https://t.me/{chat.username}"
+
+        # Bot kanalda admin bo'lishi shart (obuna tekshiruvi ishlashi uchun)
+        warning = ""
+        try:
+            me = bot.get_me()
+            member = bot.get_chat_member(channel_id, me.id)
+            if getattr(member, "status", "") not in ("administrator", "creator"):
+                warning = "\n\n⚠️ Bot bu kanalda admin emas — obuna tekshiruvi ishlamaydi!"
+        except Exception as error:
+            warning = f"\n\n⚠️ Botning kanaldagi holati tekshirilmadi: {html.escape(str(error)[:80])}"
+
+        if not invite_link:
+            try:
+                invite_link = bot.export_chat_invite_link(channel_id)
+            except Exception:
+                invite_link = ""
 
         add_channel(channel_id, channel_name, invite_link)
-        
-        safe_name = html.escape(channel_name)
-        safe_id = html.escape(channel_id)
-        safe_link = html.escape(invite_link)
-        
-        success_text = (
-            f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n\n"
-            f"📢 <b>Nomi:</b> {safe_name}\n"
-            f"🆔 <b>ID:</b> <code>{safe_id}</code>\n"
-            f"🔗 <b>Havola:</b> {safe_link}"
-        )
-        bot.send_message(message.chat.id, success_text, parse_mode="HTML")
 
-    except Exception as e:
+        bot.send_message(
+            message.chat.id,
+            "✅ <b>Kanal qo'shildi!</b>\n\n"
+            f"📢 Nomi: <b>{html.escape(channel_name or '-')}</b>\n"
+            f"🆔 ID: <code>{html.escape(channel_id)}</code>\n"
+            f"🔗 Havola: {html.escape(invite_link or 'yo\'q')}"
+            f"{warning}",
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard(),
+        )
+
+    except ApiTelegramException as error:
         traceback.print_exc()
-        safe_error = html.escape(str(e)[:150])
-        error_msg = (
-            f"❌ <b>Kanalni qo'shib bo'lmadi!</b>\n\n"
-            f"<b>Sababi:</b> {safe_error}\n\n"
-            f"💡 <b>Muammoni oson hal qilish chorasi:</b>\n"
-            f"Kanalingizdan bitta xabarni (postni) shu botga <b>forward (yo'naltirib)</b> yuboring! Bot kanalni avtomatik qo'shib oladi.\n\n"
-            f"⚠️ <b>Quyidagilarni tekshiring:</b>\n"
-            f"1. Bot ushbu kanalda <b>administrator</b> (admin) qilinganmi?\n"
-            f"2. Kanalning username yoki ID-si to'g'rimi?"
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Kanalni qo'shib bo'lmadi</b>\n\n"
+            f"Sababi: {html.escape(str(error.description or error)[:120])}\n\n"
+            "💡 Kanaldan bitta postni botga <b>forward</b> qilib ko'ring.\n"
+            "⚠️ Bot kanalda administrator bo'lishi shart.",
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard(),
         )
-        bot.send_message(message.chat.id, error_msg, parse_mode="HTML")
+    except Exception as error:
+        traceback.print_exc()
+        bot.send_message(
+            message.chat.id,
+            f"❌ Xatolik: {html.escape(str(error)[:120])}",
+            reply_markup=get_admin_keyboard(),
+        )
 
-def process_del_channel(message):
-    try:
-        channel_id = message.text.strip()
-        remove_channel(channel_id)
-        bot.send_message(message.chat.id, f"✅ Kanal o'chirildi! (ID: {channel_id})")
-    except Exception as e:
-        bot.send_message(message.chat.id, "❌ Xatolik yuz berdi.")
 
-# --- RENDER WEB SERVER (PING UCHUN DOIMIY UYG'OQ TUTISH) ---
+def on_del_channel(message):
+    if not take_admin_step(message, "del_channel"):
+        return
+
+    if not message.text:
+        bot.send_message(message.chat.id, "❌ Kanal ID yoki username yuboring.")
+        return
+
+    identifier = message.text.strip()
+    removed = remove_channel(identifier)
+
+    if not removed:
+        # @username bo'lsa ID ga aylantirib qayta urinamiz
+        try:
+            chat = bot.get_chat(normalize_channel_reference(identifier))
+            removed = remove_channel(str(chat.id))
+        except Exception:
+            removed = False
+
+    if removed:
+        bot.send_message(
+            message.chat.id,
+            f"✅ Kanal o'chirildi: <code>{html.escape(identifier)}</code>",
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard(),
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            "❌ Bunday kanal ro'yxatda topilmadi. Ro'yxatni tekshiring.",
+            reply_markup=get_admin_keyboard(),
+        )
+
+
+# --- RENDER UCHUN HEALTH-CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        body = b"Bot is alive and running 24/7!"
         self.send_response(200)
-        self.send_header("Content-type", "text/html")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"Bot is alive and running 24/7!")
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
         return
 
+
 def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()  # Tuzatildi! Endi server doimiy ishlaydi.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    server.serve_forever()
+
 
 # --- MAIN ---
-if __name__ == "__main__":
+def main():
+    global BOT_USERNAME
+
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN topilmadi. Render -> Environment bo'limida BOT_TOKEN kiriting.")
+        sys.exit(1)
+    if not ADMIN_IDS:
+        print("⚠️ ADMIN_ID topilmadi — admin panel ishlamaydi.")
+
+    print(f"FFmpeg: {FFMPEG_PATH} | mavjud: {ffmpeg_ready()}")
+
     threading.Thread(target=run_health_server, daemon=True).start()
-    print("Web server portda ishga tushdi...")
+    print(f"Health-check server {PORT}-portda ishga tushdi.")
+
+    try:
+        bot.remove_webhook()
+    except Exception as error:
+        print(f"[WEBHOOK] tozalanmadi: {error}")
+
+    try:
+        BOT_USERNAME = bot.get_me().username or ""
+        print(f"Bot: @{BOT_USERNAME}")
+    except Exception as error:
+        print(f"[GETME] {error}")
+
+    try:
+        bot.set_my_commands(
+            [
+                types.BotCommand("start", "Botni ishga tushirish"),
+                types.BotCommand("id", "Mening ID raqamim"),
+            ]
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.set_my_commands(
+                    [
+                        types.BotCommand("start", "Botni ishga tushirish"),
+                        types.BotCommand("admin", "Admin panel"),
+                        types.BotCommand("id", "Mening ID raqamim"),
+                        types.BotCommand("cancel", "Amalni bekor qilish"),
+                    ],
+                    scope=types.BotCommandScopeChat(admin_id),
+                )
+            except Exception:
+                pass
+    except Exception as error:
+        print(f"[COMMANDS] {error}")
+
     print("Bot muvaffaqiyatli ishga tushdi...")
-    bot.infinity_polling()
+    # skip_pending=True: bot qayta ishga tushganda eski (masalan, tugallanmagan
+    # ommaviy xabar) so'rovlar bajarilmaydi.
+    bot.infinity_polling(
+        timeout=60, long_polling_timeout=60, skip_pending=True, none_stop=True
+    )
+
+
+if __name__ == "__main__":
+    main()
