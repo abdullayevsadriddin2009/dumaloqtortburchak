@@ -2,16 +2,11 @@
 """
 Video konverter bot: dumaloq (video note) <-> to'rtburchak video.
 
-MUHIM: token va admin ID endi kodda emas, muhit o'zgaruvchilarida saqlanadi.
-Render -> Environment bo'limida quyidagilarni to'ldiring:
+Sozlamalar quyida, DEFAULT_... qatorlarida turadi. Render'da hech narsa
+sozlash shart emas — kod o'zi ishlaydi.
 
-    BOT_TOKEN    - 8357374445:AAFJfx3qYEc-fWVEZ-T-O3tILQ5UO74m6Lc          (majburiy)
-    ADMIN_ID     - 6377032074        (majburiy, botda /id orqali)
-    DB_FILE      - SQLite fayl yo'li                (ixtiyoriy)
-    MAX_INPUT_MB - qabul qilinadigan video hajmi    (ixtiyoriy, standart 20)
-    MAX_WORKERS  - bir vaqtda ishlaydigan ffmpeg    (ixtiyoriy, standart 2)
-    PORT         - health-check porti               (Render o'zi beradi)
-    FFMPEG_PATH  - ffmpeg yo'li                     (ixtiyoriy)
+MUHIM: bu faylda token ochiq yozilgan. GitHub repo **private** bo'lishi
+shart, aks holda istalgan odam tokenni olib botni boshqaradi.
 """
 
 import html
@@ -36,6 +31,34 @@ from telebot.apihelper import ApiTelegramException
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def load_env_file(path=None):
+    """Kompyuterda ishlatish uchun: bot.py yonidagi .env faylini o'qiydi.
+
+    Render'da .env kerak emas — u yerda Environment bo'limidagi
+    o'zgaruvchilar ishlatiladi. Allaqachon mavjud o'zgaruvchilar
+    o'zgartirilmaydi (muhit ustuvor).
+    """
+    path = path or os.path.join(BASE_DIR, ".env")
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+load_env_file()
+
+
 def _env(name, default=""):
     return (os.environ.get(name) or default).strip()
 
@@ -47,10 +70,17 @@ def _env_int(name, default=0):
         return default
 
 
-BOT_TOKEN = _env("BOT_TOKEN")
+# --- ASOSIY SOZLAMALAR (shu yerni o'zgartirasiz) ---
+# BotFather bergan token:
+DEFAULT_BOT_TOKEN = "8357374445:AAFJfx3qYEc-fWVEZ-T-O3tILQ5UO74m6Lc"
+# Adminning Telegram ID si (bir nechta bo'lsa vergul bilan: "111,222"):
+DEFAULT_ADMIN_ID = "6377032074"
+
+# Muhit o'zgaruvchisi berilgan bo'lsa u ustun turadi (ixtiyoriy).
+BOT_TOKEN = _env("BOT_TOKEN") or DEFAULT_BOT_TOKEN
 ADMIN_IDS = {
     int(part)
-    for part in _env("ADMIN_ID").replace(";", ",").split(",")
+    for part in (_env("ADMIN_ID") or DEFAULT_ADMIN_ID).replace(";", ",").split(",")
     if part.strip().lstrip("-").isdigit()
 }
 DB_FILE = _env("DB_FILE", os.path.join(BASE_DIR, "bot_database.db"))
@@ -1046,7 +1076,17 @@ def main():
     global BOT_USERNAME
 
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN topilmadi. Render -> Environment bo'limida BOT_TOKEN kiriting.")
+        print(
+            "❌ BOT_TOKEN topilmadi.\n"
+            "\nRender'da (bir marta qilinadi):\n"
+            "  1) Dashboard -> botingiz (Web Service) -> chap menyuda 'Environment'\n"
+            "  2) 'Add Environment Variable' -> Key: BOT_TOKEN, Value: @BotFather bergan token\n"
+            "  3) Yana bittasi -> Key: ADMIN_ID, Value: sizning Telegram ID ingiz (/id)\n"
+            "  4) 'Save Changes' -> Render o'zi qayta deploy qiladi\n"
+            "\nKompyuterda ishlatayotgan bo'lsangiz: bot.py yonida .env fayl yarating:\n"
+            "  BOT_TOKEN=...\n"
+            "  ADMIN_ID=...\n"
+        )
         sys.exit(1)
     if not ADMIN_IDS:
         print("⚠️ ADMIN_ID topilmadi — admin panel ishlamaydi.")
