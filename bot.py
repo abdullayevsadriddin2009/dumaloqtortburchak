@@ -99,6 +99,10 @@ ALLOWED_UPDATES = [
     "chosen_inline_result",
 ]
 
+# Dumaloq video (video note) o'lchami. Telegram 640px dan katta kvadratni
+# video note qilib qabul qilmaydi — oddiy video qilib yuboradi.
+SQUARE_SIZE = 512
+
 PORT = _env_int("PORT", 8080)
 STEP_TTL = 600          # admin amallari uchun kutish vaqti (soniya)
 BROADCAST_TTL = 900     # ommaviy xabarni tasdiqlash muddati (soniya)
@@ -377,14 +381,16 @@ def run_ffmpeg(command, timeout=900):
 def make_square_video(input_path, output_path):
     """To'rtburchak videoni dumaloq (video note) uchun kvadratga keltiradi.
 
-    sifat uchun: video kattalashtirilmaydi va 480px ga tushirilmaydi —
-    o'rtasidan asl o'lchamda kvadrat qirqiladi (1080px dan katta bo'lsa
-    faqat shunda kichraytiriladi), fps va ovoz asl holida qoladi.
-    Telegram video note uchun: kvadrat, H.264, yuv420p, 1:1 SAR, <=60 soniya.
+    MUHIM: Telegram video note'ni faqat kvadrat va o'lchami 640px dan
+    kichik bo'lsa yaratadi; aks holda jimgina oddiy video qilib yuboradi
+    (shu sabab "dumaloq bo'lmadi" muammosi chiqqan edi). Shuning uchun
+    natija doim 512x512 bo'ladi — bu dumaloq ko'rinish uchun yetarli
+    sifat (chatda 240-384px ko'rsatiladi).
+    O'rtasidan asl piksellarda qirqiladi, fps va ovoz asl holida qoladi.
     """
     filter_complex = (
         "[0:v]crop='min(iw,ih)':'min(iw,ih)',"          # markazdan kvadrat, asl pikselda
-        "scale='min(1080,trunc(iw/2)*2)':-2:flags=lanczos,"  # faqat kerak bo'lsa kichraytirish
+        f"scale={SQUARE_SIZE}:{SQUARE_SIZE}:flags=lanczos,"  # video note chegarasi
         "setsar=1,format=yuv420p[v]"
     )
     command = [
@@ -728,6 +734,7 @@ def conversion_job(message, kind, status_message_id):
                     return bot.send_video_note(
                         chat_id,
                         video_file,
+                        length=SQUARE_SIZE,  # fayl o'lchamiga mos bo'lishi shart
                         reply_to_message_id=message.message_id,
                         timeout=600,
                     )
