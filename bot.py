@@ -375,7 +375,9 @@ def run_ffmpeg(command, timeout=900):
     if result.returncode != 0:
         details = (result.stderr or "").strip().splitlines()[-6:]
         print("[FFMPEG] " + " | ".join(details))
-        raise RuntimeError("FFmpeg videoni qayta ishlay olmadi.")
+        # Xatoning aniq sababi adminga ko'rinishi uchun matnni saqlaymiz.
+        tail = " | ".join(details)[:280] or "noma'lum xato"
+        raise RuntimeError(f"FFmpeg: {tail}")
 
 
 def make_square_video(input_path, output_path):
@@ -411,29 +413,19 @@ def make_square_video(input_path, output_path):
 
 
 def make_rectangle_video(input_path, output_path):
-    """Dumaloq (kvadrat) videoni to'liq kadrli 16:9 videoga aylantiradi.
+    """Dumaloq (kvadrat) videoni oddiy (to'rtburchak) videoga aylantiradi.
 
-    Yon tomonlarda xira (blur) fon QO'YILMAYDI: video o'rtasidan 16:9
-    qirqiladi va kadrni to'liq egallaydi. Qirqish asl piksellarda
-    bajariladi — video kattalashtirilmaydi, shuning uchun sifat
-    yo'qolmaydi. Kenglik 1920px dan oshsa, mutanosib kichraytiriladi.
+    KESISH YO'Q: avval 16:9 ga qirqilardi va tepa qismi (bosh, yuz)
+    kesilib qolardi. Endi kadr 100% saqlanadi — kvadrat note o'z
+    mutanosibligida (kvadrat video sifatida) chiqadi, yon tomonlarga
+    xira fon ham qo'yilmaydi. Shu bilan hech qanday detal yo'qolmaydi.
     """
-    # Markazdan 16:9 qirqish: kengroq videoda yon, balandroq videoda tepa/past
-    # qirqiladi. Qirqish asl piksellarda, hech qanday kattalashtirish yo'q.
-    crop_expr = (
-        "crop=w='if(gte(iw/ih,1.7777),trunc(ih*16/9/2)*2,trunc(iw/2)*2)':"
-        "h='if(gte(iw/ih,1.7777),trunc(ih/2)*2,trunc(iw*9/16/2)*2)'"
-    )
-    filter_complex = (
-        "[0:v]" + crop_expr + ","
-        "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
-        "setsar=1,format=yuv420p[v]"
-    )
     command = [
         FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
-        "-filter_complex", filter_complex,
-        "-map", "[v]", "-map", "0:a:0?",
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", "scale=w='min(1280,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+        "setsar=1,format=yuv420p",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-threads", "2",
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
@@ -750,7 +742,25 @@ def conversion_job(message, kind, status_message_id):
                         timeout=600,
                     )
 
-        with_retry(send)
+        try:
+            with_retry(send)
+        except ApiTelegramException as error:
+            # Telegram dumaloq videoni rad etsa (400), foydalanuvchini xato
+            # bilan qoldirmaymiz — oddiy video sifatida yuboramiz.
+            if kind != "to_note" or error.error_code != 400:
+                raise
+            print(f"[NOTE] Telegram rad etdi, video sifatida yuborildi: {error}")
+            with open(output_path, "rb") as video_file:
+                with_retry(
+                    lambda: bot.send_video(
+                        chat_id,
+                        video_file,
+                        caption="🎥 Videongiz tayyor!",
+                        supports_streaming=True,
+                        reply_to_message_id=message.message_id,
+                        timeout=600,
+                    )
+                )
 
         try:
             bot.delete_message(chat_id, status_message_id)
@@ -770,6 +780,10 @@ def conversion_job(message, kind, status_message_id):
                 "❌ Natija hajmi 50 MB dan oshib ketdi (Telegram chegarasi).\n"
                 "Qisqaroq yoki kichikroq o'lchamdagi video yuboring."
             )
+        # Admin uchun aniq sabab (foydalanuvchiga ko'rsatilmaydi).
+        if user_id in ADMIN_IDS:
+            reason = str(error)[:280].replace("<", "&lt;").replace(">", "&gt;")
+            text += f"\n\n<i>Sabab: {reason}</i>"
         safe_edit(chat_id, status_message_id, text)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
