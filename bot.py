@@ -141,7 +141,7 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.10"
+BUILD_VERSION = "2026-11-10.11"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1377,7 +1377,16 @@ def _yt_options(url, workdir, client=None):
         options["ffmpeg_location"] = folder
     cookies = yt_cookies_file()
     if cookies:
-        options["cookiefile"] = cookies
+        # Render "Secret Files" faqat o'qish uchun mount qilinadi, yt-dlp esa
+        # ish oxirida cookie faylini qayta yozmoqchi bo'ladi (OSError: Read-only
+        # file system). Shuning uchun ishchi papkaga nusxa olamiz.
+        local_cookies = os.path.join(workdir, "cookies.txt")
+        try:
+            shutil.copyfile(cookies, local_cookies)
+            options["cookiefile"] = local_cookies
+        except OSError as error:
+            print(f"[YTDLP] cookie nusxalanmadi ({error}); asl fayl ishlatiladi")
+            options["cookiefile"] = cookies
     if client and client != "default":
         options["extractor_args"] = {"youtube": {"player_client": [client]}}
     return options
@@ -1551,6 +1560,11 @@ def link_job(message, url, status_message_id):
             text = (
                 "❌ Bu video yopiq (private) yoki login talab qiladi — "
                 "uni yuklab bo'lmadi."
+            )
+        elif "read-only file system" in lowered and "cookies" in lowered:
+            text = (
+                "❌ Cookie faylini o'qishda xatolik. Admin: Render'dagi "
+                "cookies.txt ni tekshiring."
             )
         elif is_youtube_url(url) and _is_bot_check(reason):
             text = (
