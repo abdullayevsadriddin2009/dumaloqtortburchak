@@ -138,7 +138,7 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.4"
+BUILD_VERSION = "2026-11-10.6"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -281,6 +281,10 @@ def _firebase_certificate():
 def init_firestore():
     """Firestore'ga ulanadi. Muvaffaqiyatli bo'lsa True."""
     global _fs_client, _fs_ready
+    # Testlarda (va ataylab o'chirish kerak bo'lganda) bulutga tegmaslik uchun
+    if _env("DISABLE_FIRESTORE"):
+        print("[DB] Firestore o'chirilgan (DISABLE_FIRESTORE) — SQLite ishlatiladi.")
+        return False
     if not FIREBASE_LIB:
         print("[DB] firebase-admin topilmadi — SQLite ishlatiladi.")
         return False
@@ -1814,6 +1818,29 @@ def status_snapshot():
     return data
 
 
+def _poll_once(offset):
+    """get_updates ni chaqiradi, telebot versiyalari imzosi turlicha bo'lsa ham.
+
+    Ba'zi versiyalarda `long_polling_timeout` bor, ba'zilarida yo'q; noto'g'ri
+    kalit so'z TypeError beradi. Bunday holda eng oddiy imzoga o'tamiz —
+    polling hech qachon shu sababdan to'xtab qolmasin.
+    """
+    try:
+        return bot.get_updates(
+            offset=offset,
+            timeout=15,
+            long_polling_timeout=30,
+            allowed_updates=ALLOWED_UPDATES,
+        )
+    except TypeError as error:
+        print(f"[POLL] get_updates imzosi mos kelmadi ({error}); oddiy variant...")
+        return bot.get_updates(
+            offset=offset,
+            timeout=30,
+            allowed_updates=ALLOWED_UPDATES,
+        )
+
+
 def watchdog_loop():
     """Polling umuman javob bermay qolsa adminni ogohlantiradi va logga yozadi.
 
@@ -2014,12 +2041,12 @@ def main():
     while True:
         STATE["polling"] = True
         try:
-            updates = bot.get_updates(
-                offset=offset,
-                timeout=30,                 # long polling (server tomonda kutish)
-                allowed_updates=ALLOWED_UPDATES,
-                request_timeout=(15, 45),    # (ulanish, o'qish) — qat'iy chegarasi
-            )
+            # telebot 4.37 imzosi: get_updates(offset, limit, timeout,
+            # allowed_updates, long_polling_timeout).
+            # timeout -> tarmoq (ulanish/o'qish) chegarasi, long_polling_timeout
+            # -> Telegram serverida kutish vaqti. Ikkalasi ham chegaralangan,
+            # shuning uchun socket jim osilib qolmaydi.
+            updates = _poll_once(offset)
         except ApiTelegramException as error:
             code = getattr(error, "error_code", None)
             STATE["last_poll_note"] = f"{code}: {str(error)[:100]}"
