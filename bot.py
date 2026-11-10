@@ -12,6 +12,8 @@ shart, aks holda istalgan odam tokenni olib botni boshqaradi.
 import html
 import json
 import os
+import random
+import urllib.request
 import re
 import shutil
 import sqlite3
@@ -141,7 +143,7 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.12"
+BUILD_VERSION = "2026-11-10.14"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1360,6 +1362,158 @@ def yt_proxy():
     return _env("YT_PROXY") or _env("YOUTUBE_PROXY") or ""
 
 
+# ---------------------------------------------------------------- bepul proxy
+# YouTube bu serverning IP'sini bloklaydi. Qo'lda proxy (YT_PROXY) bo'lmasa,
+# ochiq (bepul) proxy ro'yxatlaridan ishlaydiganini sinab tanlaymiz.
+FREE_PROXY_LISTS = (
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies"
+    "&protocol=http&proxy_format=protocolipport&format=text&timeout=2000",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+)
+PROXY_TEST_URL = "https://www.youtube.com/watch?v=2-WBhcjq00g"
+PROXY_TTL = 900            # topilgan proxy 15 daqiqa ishlatiladi
+PROXY_RETRY_AFTER = 600    # topilmasa, 2 daqiqadan keyin qayta urinamiz
+PROXY_BATCH = 300
+UA_BROWSER = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+_proxy_state = {"value": "", "at": 0.0, "fail_at": 0.0, "bad": set()}
+_proxy_lock = threading.Lock()
+_proxy_searching = threading.Event()
+
+
+def free_proxy_enabled():
+    """YT_FREE_PROXY=0 bilan o'chirish mumkin. Qo'lda proxy bo'lsa — kerak emas."""
+    raw = (_env("YT_FREE_PROXY") or "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return not yt_proxy()
+
+
+def _fetch_free_proxies():
+    found = []
+    for url in FREE_PROXY_LISTS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA_BROWSER})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read(300000).decode("utf-8", "ignore")
+        except Exception as error:
+            print(f"[PROXY] ro'yxat olinmadi ({url}): {error}")
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or " " in line:
+                continue
+            if not line.startswith(("http://", "https://")):
+                line = "http://" + line
+            if re.fullmatch(r"https?://[0-9.]+:\d{2,5}", line):
+                found.append(line)
+    unique = []
+    seen = set()
+    for proxy in found:
+        if proxy not in seen:
+            seen.add(proxy)
+            unique.append(proxy)
+    print(f"[PROXY] {len(unique)} ta bepul proxy topildi, sinaladi...")
+    return unique
+
+
+def _proxy_alive(proxy):
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    req = urllib.request.Request(
+        PROXY_TEST_URL, headers={"User-Agent": UA_BROWSER,
+                                 "Accept-Language": "en-US,en;q=0.9"}
+    )
+    try:
+        with opener.open(req, timeout=6) as resp:
+            body = resp.read(500000).decode("utf-8", "ignore")
+    except Exception:
+        return False
+    if "ytInitialPlayerResponse" not in body:
+        return False
+    return "Sign in to confirm" not in body
+
+
+def find_free_proxy(force=False):
+    if _proxy_searching.is_set():
+        # boshqa ip qidirmoqda — uning natijasini kutamiz (ko'pi bilan 90 s)
+        _proxy_searching.wait(timeout=90)
+        return _proxy_state["value"]
+    with _proxy_lock:
+        if _proxy_searching.is_set():
+            _proxy_searching.wait(timeout=90)
+            return _proxy_state["value"]
+        _proxy_searching.set()
+    try:
+        return _find_free_proxy_locked(force=force)
+    finally:
+        _proxy_searching.clear()
+
+
+def _find_free_proxy_locked(force=False):
+    now = time.time()
+    if not force:
+        if _proxy_state["value"] and now - _proxy_state["at"] < PROXY_TTL:
+            return _proxy_state["value"]
+        if now - _proxy_state["fail_at"] < PROXY_RETRY_AFTER:
+            return ""
+    if len(_proxy_state["bad"]) > 3000:
+        _proxy_state["bad"].clear()
+    candidates = [p for p in _fetch_free_proxies() if p not in _proxy_state["bad"]]
+    random.shuffle(candidates)
+    candidates = candidates[:PROXY_BATCH]
+    if not candidates:
+        _proxy_state["fail_at"] = now
+        return ""
+    executor = ThreadPoolExecutor(max_workers=50)
+    try:
+        futures = {executor.submit(_proxy_alive, p): p for p in candidates}
+        for future in _futures_as_completed(futures):
+            proxy = futures[future]
+            try:
+                ok = future.result()
+            except Exception:
+                ok = False
+            if ok:
+                _proxy_state.update(value=proxy, at=time.time(), fail_at=0.0)
+                print(f"[PROXY] ishlaydigan bepul proxy: {proxy}")
+                return proxy
+            _proxy_state["bad"].add(proxy)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    _proxy_state["fail_at"] = time.time()
+    print("[PROXY] hozircha ishlaydigan bepul proxy topilmadi")
+    return ""
+
+
+def _futures_as_completed(futures):
+    while futures:
+        done = [f for f in futures if f.done()]
+        if not done:
+            time.sleep(0.2)
+            continue
+        for future in done:
+            yield future
+        futures = {f: p for f, p in futures.items() if f not in done}
+
+
+def resolve_proxy(url, force=False):
+    """Qo'lda proxy bo'lsa — o'sha; bo'lmasa YouTube uchun bepul proxy."""
+    manual = yt_proxy()
+    if manual:
+        return manual
+    if free_proxy_enabled() and is_youtube_url(url):
+        return find_free_proxy(force=force)
+    return ""
+
+
 def _yt_options(url, workdir, client=None):
     options = {
         "outtmpl": os.path.join(workdir, "%(title).80B.%(ext)s"),
@@ -1382,7 +1536,7 @@ def _yt_options(url, workdir, client=None):
     folder = os.path.dirname(FFMPEG_PATH or "")
     if folder and os.path.isdir(folder):
         options["ffmpeg_location"] = folder
-    proxy = yt_proxy()
+    proxy = resolve_proxy(url)
     if proxy:
         options["proxy"] = proxy
     cookies = yt_cookies_file()
@@ -1981,7 +2135,11 @@ def status_snapshot():
         "ffprobe": bool(FFPROBE_PATH),
         "yt_dlp": YTDLP_LIB,
         "cookies": bool(yt_cookies_file()),
-        "proxy": bool(yt_proxy()),
+        "proxy": bool(yt_proxy()) or bool(_proxy_state["value"]),
+        "proxy_mode": "manual" if yt_proxy() else (
+            "auto" if free_proxy_enabled() else "off"
+        ),
+        "free_proxy": _proxy_state["value"] or "",
     }
     for key, getter in (
         ("users", count_users),
@@ -2101,7 +2259,7 @@ def status_handler(message):
         f"▪️ Foydalanuvchilar: {data['users']} | Kanallar: {data['channels']}",
         f"▪️ Firestore: {data['firestore']} | yt-dlp: {data['yt_dlp']}",
         f"▪️ Cookies: {'✅' if data['cookies'] else '❌'} | "
-        f"Proxy: {'✅' if data['proxy'] else '❌'}",
+        f"Proxy: {'✅' if data['proxy'] else '❌'} ({data['proxy_mode']})",
     ]
     try:
         bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
@@ -2209,6 +2367,8 @@ def main():
             print(f"[BOOT] xabar yuborilmadi: {error}")
 
     print(f"Bot muvaffaqiyatli ishga tushdi... [BUILD {BUILD_VERSION}]")
+    if free_proxy_enabled():
+        threading.Thread(target=find_free_proxy, daemon=True).start()
 
     # Polling ATAYIN qo'lda yozilgan (telebot'ning infinity_polling'i o'rniga):
     # 1) har bir so'rovda qat'iy timeout bor — socket jim qotib qolmaydi;
