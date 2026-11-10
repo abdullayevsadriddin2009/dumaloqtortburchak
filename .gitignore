@@ -11,3 +11,7 @@ firebase_key.json
 serviceAccountKey.json
 firebase-adminsdk*.json
 *dumaloqvideo-firebase-adminsdk*.json
+
+# YouTube cookies (maxfiy) — GitHub'ga chiqmasin
+cookies.txt
+youtube_cookies.txt
