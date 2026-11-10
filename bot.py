@@ -391,7 +391,14 @@ def make_square_video(input_path, output_path):
     O'rtasidan asl piksellarda qirqiladi, fps va ovoz asl holida qoladi.
     """
     filter_complex = (
-        "[0:v]crop='min(iw,ih)':'min(iw,ih)',"          # markazdan kvadrat, asl pikselda
+        # 1) SAR (piksel nisbati) 1:1 ga keltiriladi. Ba'zi videolar 16:15,
+        #    2:1 kabi nisbat bilan keladi — ular normallashtirilmasa natija
+        #    cho'zilgan/toraytirilgan ("2 xil") ko'rinishda chiqadi.
+        "[0:v]scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1,"
+        # 2) Markazdan kvadrat qirqish — kadr dumaloqni to'liq to'ldiradi,
+        #    qora hoshiya yoki kichraytirilgan kadr bo'lmaydi. O'lcham juft
+        #    qilinadi (toq piksel ba'zi o'lchamlarda xato beradi).
+        "crop='trunc(min(iw,ih)/2)*2':'trunc(min(iw,ih)/2)*2',"
         f"scale={SQUARE_SIZE}:{SQUARE_SIZE}:flags=lanczos,"  # video note chegarasi
         "setsar=1,format=yuv420p[v]"
     )
