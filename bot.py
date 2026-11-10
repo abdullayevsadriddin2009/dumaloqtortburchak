@@ -141,7 +141,7 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.8"
+BUILD_VERSION = "2026-11-10.10"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -774,28 +774,21 @@ def make_square_video(input_path, output_path):
 
 
 def make_rectangle_video(input_path, output_path):
-    """Dumaloq (kvadrat) videoni to'liq 16:9 to'rtburchakka aylantiradi.
+    """Dumaloq videoni oddiy videoga aylantiradi — manba nisbatini saqlab.
 
-    KESISH YO'Q va BO'SH CHEKKA YO'Q: kadr 100% saqlanadi (o'rtada o'tkir
-    video), chetlari esa shu videoning xiralashtirilgan kattalashtirilgan
-    nusxasi bilan to'ldiriladi. Shuning uchun ramka to'liq video bilan
-    qoplanadi — qora chiziqlar chiqmaydi.
+    16:9 ga majburlash yo'q: kadr kesilmaydi va yon tomonlarga bo'sh joy
+    qo'shilmaydi. Kvadrat (dumaloq) video kvadrat holda, to'liq kadr bilan
+    chiqadi; shu sababli Telegram uni dumaloq qilib ko'rsatmaydi.
     """
-    width, height = RECT_WIDTH, RECT_HEIGHT
-    filter_complex = (
-        # fon: kadrni to'liq qoplab, ortiqchasini kesib, kuchli xiralashtirish
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},gblur=sigma=25,eq=brightness=-0.06[bg];"
-        # asosiy video: to'liq kadr, o'rtaga qo'yiladi
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease:"
-        f"flags=lanczos[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[v]"
+    video_filter = (
+        "scale=w='min(1280,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+        "setsar=1,format=yuv420p"
     )
     command = [
         FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
-        "-filter_complex", filter_complex,
-        "-map", "[v]", "-map", "0:a:0?",
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", video_filter,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-threads", "2",
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
@@ -1566,10 +1559,6 @@ def link_job(message, url, status_message_id):
                 "Video faylini to'g'ridan-to'g'ri yuborsangiz, konvertatsiya "
                 "ishlaydi."
             )
-            text = (
-                "❌ YouTube bu videoni serverga berishdan bosh tortdi "
-                "(login tekshiruvi). Boshqa havola bilan urinib ko'ring."
-            )
         elif "juda katta" in lowered:
             text = (
                 f"❌ Video {MAX_SEND_MB} MB dan katta — Telegram bot bunday "
@@ -1967,6 +1956,7 @@ def status_snapshot():
         "ffmpeg": ffmpeg_ready(),
         "ffprobe": bool(FFPROBE_PATH),
         "yt_dlp": YTDLP_LIB,
+        "cookies": bool(yt_cookies_file()),
     }
     for key, getter in (
         ("users", count_users),
