@@ -12,6 +12,7 @@ shart, aks holda istalgan odam tokenni olib botni boshqaradi.
 import html
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -38,6 +39,15 @@ try:
     FIREBASE_LIB = True
 except Exception:  # pragma: no cover
     FIREBASE_LIB = False
+
+# yt-dlp — Instagram/YouTube/TikTok va boshqa havolalardan video yuklash.
+# Kutubxona bo'lmasa botning qolgan qismi ishlayveradi.
+try:
+    import yt_dlp
+
+    YTDLP_LIB = True
+except Exception:  # pragma: no cover
+    YTDLP_LIB = False
 
 # --- SOZLAMALAR (muhit o'zgaruvchilaridan) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -115,6 +125,13 @@ ALLOWED_UPDATES = [
 # video note qilib qabul qilmaydi — oddiy video qilib yuboradi.
 SQUARE_SIZE = 512
 
+# Telegram bot yuklay oladigan eng katta fayl (50 MB chegara, biroz zapas bilan).
+MAX_SEND_MB = 49
+AUDIO_CALLBACK = "extract_audio"
+
+# Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
+BUILD_VERSION = "2026-11-10"
+
 PORT = _env_int("PORT", 8080)
 STEP_TTL = 600          # admin amallari uchun kutish vaqti (soniya)
 BROADCAST_TTL = 900     # ommaviy xabarni tasdiqlash muddati (soniya)
@@ -152,6 +169,48 @@ def ffmpeg_ready():
         return result.returncode == 0
     except Exception:
         return False
+
+
+def find_ffprobe():
+    """ffprobe ffmpeg bilan bir papkada bo'ladi (Render'dagi static build)."""
+    folder = os.path.dirname(FFMPEG_PATH or "")
+    for candidate in (
+        os.path.join(folder, "ffprobe"),
+        os.path.join(folder, "ffprobe.exe"),
+    ):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("ffprobe") or ""
+
+
+FFPROBE_PATH = find_ffprobe()
+
+
+def probe_video(path):
+    """(kenglik, balandlik, davomiylik) qaytaradi; aniqlab bo'lmasa None.
+
+    Natijani send_video'ga berish uchun kerak: shunda Telegram faylni
+    albatta oddiy video deb ko'rsatadi.
+    """
+    if not FFPROBE_PATH:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:format=duration",
+                "-of", "json", path,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        data = json.loads(result.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+        duration = int(float((data.get("format") or {}).get("duration") or 0))
+        return width, height, duration
+    except Exception:
+        return None
 
 
 # --- MA'LUMOTLAR BAZASI: Firebase Firestore (+ SQLite zaxira) ---
@@ -549,6 +608,32 @@ def safe_edit(chat_id, message_id, text, reply_markup=None, parse_mode=None):
         return False
 
 
+def build_caption(extra=""):
+    """Har bir natija ostidagi imzo (@username orqali yaratildi)."""
+    sign = (
+        f"🤖 @{BOT_USERNAME} orqali yaratildi."
+        if BOT_USERNAME
+        else "🤖 Bot orqali yaratildi."
+    )
+    return (extra + "\n\n" + sign) if extra else sign
+
+
+def audio_keyboard():
+    """Video ostidagi \"Ovozni ajratib olish\" tugmasi."""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🎧 Ovozni ajratib olish", callback_data=AUDIO_CALLBACK
+        )
+    )
+    return keyboard
+
+
+def format_duration(seconds):
+    total = int(seconds or 0)
+    return f"{total // 60}:{total % 60:02d}"
+
+
 def retry_after(error, default=5):
     try:
         parameters = (error.result_json or {}).get("parameters") or {}
@@ -598,6 +683,28 @@ def run_ffmpeg(command, timeout=900):
         # Xatoning aniq sababi adminga ko'rinishi uchun matnni saqlaymiz.
         tail = " | ".join(details)[:280] or "noma'lum xato"
         raise RuntimeError(f"FFmpeg: {tail}")
+
+
+def extract_audio_track(input_path, output_path):
+    """Videodan ovozni mp3 qilib ajratadi. Ovoz bo'lmasa xato beradi."""
+    try:
+        run_ffmpeg(
+            [
+                FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", input_path,
+                "-vn", "-map", "0:a:0?",
+                "-c:a", "libmp3lame", "-q:a", "4",
+                output_path,
+            ]
+        )
+    except RuntimeError as error:
+        # Ovoz yo'q videoda ffmpeg "Output file does not contain any stream"
+        # deydi — foydalanuvchiga tushunarli sabab ko'rsatamiz.
+        if "does not contain any stream" in str(error):
+            raise RuntimeError("bu videoda ovoz (audio) yo'q") from error
+        raise
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1024:
+        raise RuntimeError("bu videoda ovoz (audio) yo'q")
 
 
 def make_square_video(input_path, output_path):
@@ -712,11 +819,17 @@ def admin_panel_text():
 
 
 INSTRUCTIONS = (
-    "👋 <b>Salom! Video konverter botga xush kelibsiz!</b>\n\n"
-    "Men avtomatik rejimda ishlayman:\n"
-    "1️⃣ Menga oddiy <b>to'rtburchak video</b> yuboring ➡️ uni <b>dumaloq video</b> qilib beraman.\n"
-    "2️⃣ Menga <b>dumaloq video</b> yuboring ➡️ uni to'liq ekranli <b>to'rtburchak videoga</b> aylantiraman.\n\n"
-    "⚡️ Shunchaki videoni yuboring va natijani oling!"
+    "👋 <b>Salom! Dumaloq ⇄ To'rtburchak video botiga xush kelibsiz!</b>\n\n"
+    "<b>1️⃣ Video o'girish</b>\n"
+    "▫️ Oddiy <b>to'rtburchak video</b> yuboring ➡️ uni <b>dumaloq video</b> qilaman.\n"
+    "▫️ <b>Dumaloq video</b> yuboring ➡️ to'liq kadrli <b>to'rtburchak video</b> qilaman.\n\n"
+    "<b>2️⃣ Ovozni ajratib olish</b>\n"
+    "Tayyor video ostidagi <b>🎧 Ovozni ajratib olish</b> tugmasini bosing ➡️ "
+    "videoning ovozi alohida (mp3) yuboriladi.\n\n"
+    "<b>3️⃣ Havoladan yuklash</b>\n"
+    "Instagram, YouTube, TikTok va boshqa saytlardagi video havolasini yuboring "
+    "➡️ videoni yuklab beraman.\n\n"
+    "⚡️ Shunchaki videoni yoki havolani yuboring — qolganini men bajaraman!"
 )
 
 
@@ -958,15 +1071,28 @@ def conversion_job(message, kind, status_message_id):
                         timeout=600,
                     )
         else:
+            # O'lcham va davomiylikni aniq beramiz — Telegram faylni dumaloq
+            # (video note) emas, oddiy to'rtburchak video deb ko'rsatadi.
+            video_kwargs = {}
+            probe = probe_video(output_path)
+            if probe:
+                video_kwargs = {
+                    "width": probe[0],
+                    "height": probe[1],
+                    "duration": probe[2],
+                }
+
             def send():
                 with open(output_path, "rb") as video_file:
                     return bot.send_video(
                         chat_id,
                         video_file,
-                        caption="🎥 Videongiz tayyor!",
+                        caption=build_caption("🎥 Videongiz tayyor!"),
                         supports_streaming=True,
+                        reply_markup=audio_keyboard(),
                         reply_to_message_id=message.message_id,
                         timeout=600,
+                        **video_kwargs,
                     )
 
         try:
@@ -982,8 +1108,9 @@ def conversion_job(message, kind, status_message_id):
                     lambda: bot.send_video(
                         chat_id,
                         video_file,
-                        caption="🎥 Videongiz tayyor!",
+                        caption=build_caption("🎥 Videongiz tayyor!"),
                         supports_streaming=True,
+                        reply_markup=audio_keyboard(),
                         reply_to_message_id=message.message_id,
                         timeout=600,
                     )
@@ -1017,6 +1144,277 @@ def conversion_job(message, kind, status_message_id):
         release_user(user_id)
 
 
+# --- OVOZNI AJRATIB OLISH ---
+def audio_job(chat_id, user_id, video):
+    workdir = tempfile.mkdtemp(prefix="audio_")
+    input_path = os.path.join(workdir, "input.mp4")
+    output_path = os.path.join(workdir, "audio.mp3")
+    try:
+        file_info = bot.get_file(video.file_id)
+        with open(input_path, "wb") as target:
+            target.write(bot.download_file(file_info.file_path))
+
+        extract_audio_track(input_path, output_path)
+
+        title = f"Ovoz {format_duration(getattr(video, 'duration', 0))}".strip()
+        with open(output_path, "rb") as audio_file:
+            with_retry(
+                lambda: bot.send_audio(
+                    chat_id,
+                    audio_file,
+                    caption=build_caption(),
+                    title=title,
+                    timeout=600,
+                )
+            )
+    except ApiTelegramException as error:
+        traceback.print_exc()
+        text = "❌ Ovozni ajratib bo'lmadi. Iltimos, qayta urinib ko'ring."
+        if error.error_code == 400 and "too big" in str(error).lower():
+            text = (
+                "❌ Bu video 20 MB dan katta — Telegram bot videoni yuklab "
+                "ololmaydi, shuning uchun ovozni ajratib bo'lmadi."
+            )
+        bot.send_message(chat_id, text)
+    except Exception as error:
+        traceback.print_exc()
+        text = "❌ Ovozni ajratib bo'lmadi. Iltimos, qayta urinib ko'ring."
+        if isinstance(error, RuntimeError) and "ovoz" in str(error):
+            text = "❌ Bu videoda ovoz (audio) yo'q — ajratadigan narsa topilmadi."
+        elif isinstance(error, RuntimeError) and "juda uzoq" in str(error):
+            text = "❌ Video juda uzun, ovoz ajratish to'xtatildi."
+        if user_id in ADMIN_IDS:
+            reason = str(error)[:280].replace("<", "&lt;").replace(">", "&gt;")
+            text += f"\n\n<i>Sabab: {reason}</i>"
+        bot.send_message(chat_id, text, parse_mode="HTML")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        release_user(user_id)
+
+
+def handle_extract_audio(call):
+    video = getattr(call.message, "video", None)
+    if video is None:
+        safe_answer(
+            call, "❌ Ovozni faqat video ostidagi tugma orqali ajratish mumkin.",
+            show_alert=True,
+        )
+        return
+
+    size = getattr(video, "file_size", 0) or 0
+    if size > MAX_INPUT_MB * 1024 * 1024:
+        safe_answer(
+            call,
+            f"❌ Video {MAX_INPUT_MB} MB dan katta — Telegram bot uni yuklab "
+            "ololmaydi, shuning uchun ovozni ajratib bo'lmaydi.",
+            show_alert=True,
+        )
+        return
+
+    user_id = call.from_user.id
+    if not acquire_user(user_id):
+        safe_answer(call, "⏳ Oldingi amalingiz tugamadi. Iltimos, kuting.", show_alert=True)
+        return
+
+    safe_answer(call, "🎧 Ovoz ajratilmoqda, biroz kuting...")
+    executor.submit(audio_job, call.message.chat.id, user_id, video)
+
+
+# --- HAVOLADAN VIDEO YUKLASH (Instagram, YouTube, TikTok...) ---
+URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+
+
+def extract_url(text):
+    match = URL_RE.search(text or "")
+    if not match:
+        return ""
+    return match.group(0).rstrip(").,>\"'")
+
+
+def download_by_url(url, workdir):
+    """Havoladan videoni yuklaydi va (fayl yo'li, sarlavha) qaytaradi."""
+    options = {
+        "outtmpl": os.path.join(workdir, "%(title).80B.%(ext)s"),
+        "format": (
+            "bv*[filesize<44M][ext=mp4]+ba[ext=m4a]/b[filesize<44M][ext=mp4]/"
+            "bv*[filesize<44M]+ba/b[filesize<44M]/best"
+        ),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "retries": 3,
+        "socket_timeout": 30,
+        "max_filesize": MAX_SEND_MB * 1024 * 1024,
+        "restrictfilenames": True,
+        "concurrent_fragment_downloads": 1,
+    }
+    folder = os.path.dirname(FFMPEG_PATH or "")
+    if folder and os.path.isdir(folder):
+        options["ffmpeg_location"] = folder
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    # Merge bo'lsa kengaytma o'zgaradi — papkadagi eng katta faylni olamiz.
+    files = [
+        os.path.join(workdir, name)
+        for name in os.listdir(workdir)
+        if not name.endswith((".part", ".ytdl", ".jpg", ".webp", ".png"))
+    ]
+    if not files:
+        raise RuntimeError("havoladan video topilmadi")
+    path = max(files, key=os.path.getsize)
+    title = (info or {}).get("title") or "Video"
+    return path, str(title)[:120]
+
+
+def ensure_mp4(input_path, workdir):
+    """Telegram video sifatida qabul qilishi uchun mp4 konteynerga keltiradi."""
+    if input_path.lower().endswith((".mp4", ".m4v")):
+        return input_path
+    output_path = os.path.join(workdir, "converted.mp4")
+    run_ffmpeg(
+        [
+            FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path,
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c", "copy", "-movflags", "+faststart",
+            output_path,
+        ]
+    )
+    return output_path
+
+
+def start_link_download(message, url):
+    user = message.from_user
+    add_user(user.id, user.username, user.first_name)
+
+    if not check_subscription(user.id):
+        bot.send_message(
+            message.chat.id,
+            "❌ Botdan foydalanish uchun kanallarga a'zo bo'ling:",
+            reply_markup=get_sub_keyboard(),
+        )
+        return
+
+    if not YTDLP_LIB:
+        bot.reply_to(
+            message, "❌ Serverda yt-dlp o'rnatilmagan. Admin bilan bog'laning."
+        )
+        return
+
+    if not ffmpeg_ready():
+        bot.reply_to(
+            message, "❌ Serverda FFmpeg topilmadi. Admin bilan bog'laning."
+        )
+        return
+
+    if not acquire_user(user.id):
+        bot.reply_to(
+            message, "⏳ Oldingi videongiz hali tayyorlanmoqda. Iltimos, kuting."
+        )
+        return
+
+    try:
+        status = bot.reply_to(message, "⬇️ Havoladan video yuklanmoqda, biroz kuting...")
+        executor.submit(link_job, message, url, status.message_id)
+    except Exception:
+        release_user(user.id)
+        raise
+
+
+def link_job(message, url, status_message_id):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    workdir = tempfile.mkdtemp(prefix="link_")
+
+    try:
+        path, title = download_by_url(url, workdir)
+        path = ensure_mp4(path, workdir)
+
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        if size_mb > MAX_SEND_MB:
+            raise RuntimeError(f"natija juda katta ({size_mb:.1f} MB)")
+
+        video_kwargs = {}
+        probe = probe_video(path)
+        if probe:
+            video_kwargs = {
+                "width": probe[0],
+                "height": probe[1],
+                "duration": probe[2],
+            }
+
+        with open(path, "rb") as video_file:
+            with_retry(
+                lambda: bot.send_video(
+                    chat_id,
+                    video_file,
+                    caption=build_caption(f"⬇️ {title}"),
+                    supports_streaming=True,
+                    reply_markup=audio_keyboard(),
+                    reply_to_message_id=message.message_id,
+                    timeout=900,
+                    **video_kwargs,
+                )
+            )
+
+        try:
+            bot.delete_message(chat_id, status_message_id)
+        except Exception:
+            pass
+
+    except Exception as error:
+        traceback.print_exc()
+        reason = str(error)
+        text = (
+            "❌ Havoladan videoni yuklab bo'lmadi.\n"
+            "Havola ochiq (private emas) ekanini tekshirib, qayta urinib ko'ring."
+        )
+        lowered = reason.lower()
+        if "login" in lowered or "cookies" in lowered or "private" in lowered:
+            text = (
+                "❌ Bu video yopiq (private) yoki login talab qiladi — "
+                "uni yuklab bo'lmadi."
+            )
+        elif "sign in" in lowered or "bot" in lowered and "confirm" in lowered:
+            text = (
+                "❌ YouTube bu videoni serverga berishdan bosh tortdi "
+                "(login tekshiruvi). Boshqa havola bilan urinib ko'ring."
+            )
+        elif "juda katta" in lowered:
+            text = (
+                f"❌ Video {MAX_SEND_MB} MB dan katta — Telegram bot bunday "
+                "faylni yubora olmaydi. Qisqaroq video tanlang."
+            )
+        elif "unsupported url" in lowered:
+            text = "❌ Bu havola qo'llab-quvvatlanmaydi. Video sahifasining havolasini yuboring."
+
+        if user_id in ADMIN_IDS:
+            safe = reason[:280].replace("<", "&lt;").replace(">", "&gt;")
+            text += f"\n\n<i>Sabab: {safe}</i>"
+        safe_edit(chat_id, status_message_id, text, parse_mode="HTML")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        release_user(user_id)
+
+
+@bot.message_handler(
+    content_types=["text"],
+    chat_types=["private"],
+    func=lambda m: bool(extract_url(m.text)) and not (m.text or "").lstrip().startswith("/"),
+)
+def handle_link(message):
+    # Admin amali (kanal havolasi, reklama posti) bilan aralashmasin.
+    if (message.chat.id, message.message_id) in consumed_messages:
+        return
+    if admin_steps.get(message.from_user.id):
+        return
+    start_link_download(message, extract_url(message.text))
+
+
 # --- CALLBACK'LAR (ADMIN PANEL) ---
 @bot.callback_query_handler(func=lambda call: True)
 def callback_listener(call):
@@ -1041,7 +1439,8 @@ def handle_callback(call):
             bot.send_message(
                 call.message.chat.id,
                 "👋 <b>Siz muvaffaqiyatli ro'yxatdan o'tdingiz!</b>\n\n"
-                "Menga oddiy video yoki dumaloq video yuboring — avtomatik o'zgartiraman!",
+                "Menga video yoki Instagram/YouTube havolasini yuboring — "
+                "qolganini o'zim bajaraman!",
                 parse_mode="HTML",
             )
         else:
@@ -1050,6 +1449,10 @@ def handle_callback(call):
 
     if data == "noop":
         safe_answer(call, "Bu kanal uchun havola sozlanmagan.")
+        return
+
+    if data == AUDIO_CALLBACK:
+        handle_extract_audio(call)
         return
 
     if not is_admin(user_id):
@@ -1380,6 +1783,19 @@ def main():
     threading.Thread(target=run_health_server, daemon=True).start()
     print(f"Health-check server {PORT}-portda ishga tushdi.")
 
+    # Telebot xatosini yozib qo'yadi va polling'ni to'xtatadi (o'zi qayta
+    # urinmaydi) — sababni pastdagi tsikl hal qiladi.
+    class _PollingErrorTracker:
+        def __init__(self):
+            self.last_error = None
+
+        def handle(self, exception) -> bool:  # True -> telebot o'zi "yutadi"
+            self.last_error = exception
+            return False
+
+    polling_errors = _PollingErrorTracker()
+    bot.exception_handler = polling_errors
+
     try:
         bot.remove_webhook()
     except Exception as error:
@@ -1421,36 +1837,60 @@ def main():
     except Exception as error:
         print(f"[COMMANDS] {error}")
 
-    print("Bot muvaffaqiyatli ishga tushdi...")
-    # skip_pending=True: bot qayta ishga tushganda eski (masalan, tugallanmagan
-    # ommaviy xabar) so'rovlar bajarilmaydi.
-    # 409 Conflict: bir xil token bilan ikkinchi nusxa ishlayotgan bo'lsa
-    # Telegram shu xatoni beradi. Bot o'chib qolmasligi uchun kutib qayta urinamiz.
+    # Bot tavsifi (BotFather'dagi "What can this bot do?" va profil matni)
+    try:
+        bot.set_my_description(
+            "🎥 Videoni dumaloq ⇄ to'rtburchak qilib beraman.\n"
+            "🎧 Video ovozini alohida mp3 qilib ajrataman.\n"
+            "⬇️ Instagram, YouTube, TikTok havolalaridan video yuklayman.\n\n"
+            "Videoni yoki havolani shunchaki yuboring!"
+        )
+        bot.set_my_short_description(
+            "Dumaloq ⇄ to'rtburchak video, ovozni ajratish va havoladan yuklash."
+        )
+    except Exception as error:
+        print(f"[DESCRIPTION] {error}")
+
+    print(f"Bot muvaffaqiyatli ishga tushdi... [BUILD {BUILD_VERSION}]")
+    # 409 Conflict: bir xil token bilan ikkinchi nusxa bot ishlayotgan bo'lsa
+    # Telegram shu xatoni beradi (Render'da eski va yangi deploy bir necha
+    # soniya birga ishlaydi — shundan ham bo'ladi).
+    # MUHIM: `none_stop=True` berilmaydi — u holda telebot xatoni o'zi yutib,
+    # 60 soniyagacha kutib ichida qayta urinadi va loglarni "Threaded polling
+    # exception" bilan to'ldiradi. non_stop=False bo'lsa polling to'xtaydi va
+    # sababni o'zimiz to'g'ri hal qilamiz.
     while True:
+        polling_errors.last_error = None
         try:
             bot.infinity_polling(
                 timeout=60,
                 long_polling_timeout=60,
-                skip_pending=False,
-                none_stop=True,
+                skip_pending=False,   # qayta ishga tushganda kelgan xabarlar yo'qolmasin
+                non_stop=False,
+                logger_level=None,    # loglar bizning [POLL] qatorlarimiz orqali
                 allowed_updates=ALLOWED_UPDATES,
             )
         except ApiTelegramException as error:
-            if error.error_code == 409:
-                print(
-                    "[POLL] 409 Conflict: bu token bilan boshqa nusxa bot ishlayapti.\n"
-                    "       Eski deployni to'xtating yoki tokenni @BotFather'da almashtiring.\n"
-                    "       20 soniyadan keyin qayta urinish..."
-                )
-                time.sleep(20)
-            elif error.error_code in (401, 404):
-                print(f"[POLL] Token qabul qilinmadi ({error.error_code}). To'xtatildi.")
-                sys.exit(1)
-            else:
-                traceback.print_exc()
-                time.sleep(5)
-        except Exception:
+            polling_errors.last_error = error
+        except Exception as error:  # noqa: BLE001 - bot hech qachon o'chmasin
+            polling_errors.last_error = error
             traceback.print_exc()
+
+        error = polling_errors.last_error
+        code = getattr(error, "error_code", None)
+        if code in (401, 404):
+            print(f"[POLL] Token qabul qilinmadi ({code}). To'xtatildi.")
+            sys.exit(1)
+        if code == 409:
+            print(
+                "[POLL] 409 Conflict: bu token bilan boshqa nusxa bot ishlayapti.\n"
+                "       Render'da eski deploy hali o'chmagan bo'lishi mumkin, yoki\n"
+                "       kompyuterda/boshqa serverda bot.py ochiq qolgan.\n"
+                "       25 soniyadan keyin qayta urinish..."
+            )
+            time.sleep(25)
+        else:
+            print(f"[POLL] Polling to'xtadi: {error}. 5 soniyadan keyin qayta...")
             time.sleep(5)
 
 
