@@ -162,7 +162,7 @@ SEND_TIMEOUT = _env_int("SEND_TIMEOUT", 3600 if LOCAL_API else 600)
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.19"
+BUILD_VERSION = "2026-11-10.20"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1355,6 +1355,25 @@ def start_conversion(message, kind):
         raise
 
 
+def file_download_url(file_path):
+    """Faylni yuklab olish manzili.
+
+    Diqqat: pyTelegramBotAPI'da `apihelper.FILE_URL` sukut bo'yicha None
+    bo'ladi (u manzilni o'zi kechiktirib yasaydi), shuning uchun uni to'g'ridan
+    to'g'ri .format() qilsa "NoneType has no attribute 'format'" xatosi
+    chiqadi. Bu yerda ikkala holat ham qo'llab-quvvatlanadi.
+    """
+    file_url = apihelper.FILE_URL
+    if not file_url:
+        api_url = apihelper.API_URL or "https://api.telegram.org/bot{0}/{1}"
+        # API_URL oxirida "/bot{0}/{1}" turadi — shuni olib tashlab, o'rniga
+        # "/file/bot{0}/{1}" qo'yamiz.
+        suffix = "/bot{0}/{1}"
+        base = api_url[: -len(suffix)] if api_url.endswith(suffix) else api_url.rstrip("/")
+        file_url = base + "/file/bot{0}/{1}"
+    return file_url.format(bot.token, file_path)
+
+
 def download_media(file_id, dest_path):
     """Faylni Telegram'dan diskka oqim bilan yozadi.
 
@@ -1362,12 +1381,24 @@ def download_media(file_id, dest_path):
     serverni o'ldiradi. Shuning uchun bo'lak-bo'lak yozamiz.
     """
     file_info = bot.get_file(file_id)
-    url = apihelper.FILE_URL.format(bot.token, file_info.file_path)
-    with urllib.request.urlopen(url, timeout=SEND_TIMEOUT) as response:
-        with open(dest_path, "wb") as target:
-            shutil.copyfileobj(response, target, length=1024 * 512)
-    if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
-        raise RuntimeError("faylni yuklab bo'lmadi")
+    file_path = getattr(file_info, "file_path", None)
+    if not file_path:
+        raise RuntimeError("fayl yo'li topilmadi")
+    url = file_download_url(file_path)
+
+    last_error = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(url, timeout=SEND_TIMEOUT) as response:
+                with open(dest_path, "wb") as target:
+                    shutil.copyfileobj(response, target, length=1024 * 512)
+            if os.path.getsize(dest_path) > 0:
+                return dest_path
+            raise RuntimeError("bo'sh fayl yuklandi")
+        except Exception as error:  # qayta urinamiz — tarmoq uzilishi bo'lishi mumkin
+            last_error = error
+            time.sleep(2)
+    raise RuntimeError(f"faylni yuklab bo'lmadi: {last_error}")
 
 
 def conversion_job(message, kind, status_message_id):
