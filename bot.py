@@ -141,7 +141,7 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.7"
+BUILD_VERSION = "2026-11-10.8"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1280,6 +1280,77 @@ def yt_cookies_file():
     return None
 
 
+def fit_for_telegram(input_path, workdir, limit_mb=None):
+    """Har qanday o'lchamdagi videoni Telegram yubora oladigan holatga keltiradi.
+
+    Qaytaradi: fayllar ro'yxati. Bitta fayl chegaraga sig'sa — bitta element.
+    Sig'masa: avval siqiladi; sifat juda tushib ketadigan bo'lsa (uzun video),
+    bir necha bo'lakka bo'linadi. Shunda 1 GB video ham yuboriladi.
+    """
+    limit_mb = limit_mb or MAX_SEND_MB
+    size_mb = os.path.getsize(input_path) / (1024 * 1024)
+    if size_mb <= limit_mb:
+        return [input_path]
+
+    info = probe_video(input_path)
+    duration = info[2] if info else 0
+    if not duration or duration <= 0:
+        return [input_path]
+
+    # Bitta faylga sig'dirish uchun kerak bo'ladigan umumiy bitrate (kbps)
+    total_kbps = (limit_mb - 3) * 8 * 1024 / duration
+    audio_kbps = 96
+    video_kbps = int(total_kbps - audio_kbps)
+    print(
+        f"[FIT] {size_mb:.1f} MB, {duration:.0f}s — "
+        f"kerakli bitrate: {total_kbps:.0f} kbps"
+    )
+
+    if video_kbps >= 320:
+        out = os.path.join(workdir, "fit.mp4")
+        height = 720 if video_kbps >= 900 else (480 if video_kbps >= 500 else 360)
+        run_ffmpeg([
+            FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path,
+            "-vf", f"scale=-2:'min({height},ih)':flags=lanczos,setsar=1,format=yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+            "-b:v", f"{video_kbps}k", "-maxrate", f"{int(video_kbps * 1.4)}k",
+            "-bufsize", f"{video_kbps * 2}k",
+            "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
+            out,
+        ])
+        if os.path.getsize(out) / (1024 * 1024) <= limit_mb:
+            print(f"[FIT] siqildi: {os.path.getsize(out) / (1024 * 1024):.1f} MB")
+            return [out]
+        print("[FIT] bitta faylga sig'madi — bo'laklarga bo'linadi")
+
+    # Bo'laklash: sifatni saqlab, har bir bo'lak chegaradan kichik bo'lsin
+    part_kbps = 800                      # bo'laklar uchun qulay sifat
+    part_sec = max(20, int((limit_mb - 3) * 8 * 1024 / part_kbps))
+    pattern = os.path.join(workdir, "part_%03d.mp4")
+    run_ffmpeg([
+        FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-vf", "scale=-2:'min(720,ih)':flags=lanczos,setsar=1,format=yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+        "-b:v", f"{part_kbps}k", "-maxrate", f"{int(part_kbps * 1.4)}k",
+        "-bufsize", f"{part_kbps * 2}k", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k",
+        "-f", "segment", "-segment_time", str(part_sec),
+        "-reset_timestamps", "1", "-movflags", "+faststart",
+        pattern,
+    ])
+    parts = sorted(
+        os.path.join(workdir, name)
+        for name in os.listdir(workdir)
+        if name.startswith("part_") and name.endswith(".mp4")
+    )
+    print(f"[FIT] {len(parts)} bo'lakka bo'lindi")
+    return parts or [input_path]
+
+
 def is_youtube_url(url):
     return "youtube.com" in url or "youtu.be" in url
 
@@ -1292,9 +1363,11 @@ YOUTUBE_CLIENTS = ("default", "web_safari", "tv", "android_vr")
 def _yt_options(url, workdir, client=None):
     options = {
         "outtmpl": os.path.join(workdir, "%(title).80B.%(ext)s"),
+        # Hajm chegarasi yo'q: kerak bo'lsa keyin siqiladi yoki bo'laklarga
+        # bo'linadi. 720p dan yuqorisini yuklash ortiqcha vaqt oladi.
         "format": (
-            "bv*[filesize<44M][ext=mp4]+ba[ext=m4a]/b[filesize<44M][ext=mp4]/"
-            "bv*[filesize<44M]+ba/b[filesize<44M]/best"
+            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/"
+            "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
         ),
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -1303,7 +1376,6 @@ def _yt_options(url, workdir, client=None):
         "noprogress": True,
         "retries": 3,
         "socket_timeout": 30,
-        "max_filesize": MAX_SEND_MB * 1024 * 1024,
         "restrictfilenames": True,
         "concurrent_fragment_downloads": 1,
     }
@@ -1428,32 +1500,46 @@ def link_job(message, url, status_message_id):
         path, title = download_by_url(url, workdir)
         path = ensure_mp4(path, workdir)
 
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-        if size_mb > MAX_SEND_MB:
-            raise RuntimeError(f"natija juda katta ({size_mb:.1f} MB)")
-
-        video_kwargs = {}
-        probe = probe_video(path)
-        if probe:
-            video_kwargs = {
-                "width": probe[0],
-                "height": probe[1],
-                "duration": probe[2],
-            }
-
-        with open(path, "rb") as video_file:
-            with_retry(
-                lambda: bot.send_video(
-                    chat_id,
-                    video_file,
-                    caption=build_caption(f"⬇️ {title}"),
-                    supports_streaming=True,
-                    reply_markup=audio_keyboard(),
-                    reply_to_message_id=message.message_id,
-                    timeout=900,
-                    **video_kwargs,
-                )
+        # Hajmi qanday bo'lishidan qat'i nazar yuboriladi: sig'masa siqiladi,
+        # juda uzun bo'lsa bo'laklarga bo'linadi.
+        parts = fit_for_telegram(path, workdir)
+        total = len(parts)
+        if total > 1:
+            safe_edit(
+                chat_id,
+                status_message_id,
+                f"⬇️ Yuklandi, {total} bo'lakka bo'lindi — yuborilmoqda...",
             )
+
+        for index, part in enumerate(parts, 1):
+            video_kwargs = {}
+            probe = probe_video(part)
+            if probe:
+                video_kwargs = {
+                    "width": probe[0],
+                    "height": probe[1],
+                    "duration": probe[2],
+                }
+            caption = f"⬇️ {title}" if total == 1 else f"⬇️ {title} ({index}/{total})"
+            try:
+                with open(part, "rb") as video_file:
+                    with_retry(
+                        lambda video_file=video_file, caption=caption,
+                        video_kwargs=video_kwargs: bot.send_video(
+                            chat_id,
+                            video_file,
+                            caption=build_caption(caption),
+                            supports_streaming=True,
+                            reply_markup=audio_keyboard(),
+                            reply_to_message_id=message.message_id,
+                            timeout=1800,
+                            **video_kwargs,
+                        )
+                    )
+            except Exception:
+                traceback.print_exc()
+                if total == 1:
+                    raise
 
         try:
             bot.delete_message(chat_id, status_message_id)
