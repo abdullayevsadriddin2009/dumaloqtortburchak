@@ -1,1 +1,2 @@
-pyTelegramBotAPI
+pyTelegramBotAPI==4.37.1
+firebase-admin==6.8.0
