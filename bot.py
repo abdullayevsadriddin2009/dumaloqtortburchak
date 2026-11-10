@@ -116,7 +116,17 @@ ADMIN_IDS = {
     if part.strip().lstrip("-").isdigit()
 }
 DB_FILE = _env("DB_FILE", os.path.join(BASE_DIR, "bot_database.db"))
-MAX_INPUT_MB = _env_int("MAX_INPUT_MB", 20)
+
+# LOCAL BOT API SERVER (ixtiyoriy, Docker bilan birga keladi).
+# Telegram'ning oddiy Bot API'si botga 20 MB dan katta fayl yuklab olishga
+# ruxsat bermaydi va 50 MB dan katta faylni yubortirmaydi. Shuning uchun
+# konteyner ichida `telegram-bot-api` (local rejim) ishga tushiriladi va bot
+# unga ulanadi: u holda 2 GB gacha video qabul qilinadi va yuboriladi.
+# TELEGRAM_API_URL berilmasa — hammasi avvalgidek api.telegram.org orqali.
+TELEGRAM_API_URL = (_env("TELEGRAM_API_URL") or "").rstrip("/")
+LOCAL_API = bool(TELEGRAM_API_URL)
+
+MAX_INPUT_MB = _env_int("MAX_INPUT_MB", 1900 if LOCAL_API else 20)
 MAX_WORKERS = max(1, _env_int("MAX_WORKERS", 2))
 # Telegram botga qaysi turdagi yangilanishlar kerak. callback_query BO'LMASA
 # inline tugmalar (admin panel) umuman ishlamaydi — shuning uchun ro'yxat
@@ -133,17 +143,26 @@ ALLOWED_UPDATES = [
 
 # Dumaloq video (video note) o'lchami. Telegram 640px dan katta kvadratni
 # video note qilib qabul qilmaydi — oddiy video qilib yuboradi.
-SQUARE_SIZE = 512
+SQUARE_SIZE = 638  # Telegram video note chegarasi 639px
+# Dumaloq video (video note) uchun Telegram hajm chegarasi: 12 MB.
+# Oshib ketsa Telegram 400 qaytaradi va video oddiy (to'rtburchak) bo'lib
+# ketadi. Shuning uchun zaxira bilan 11.5 MB ga mo'ljaymiz.
+NOTE_MAX_BYTES = 12 * 1024 * 1024
+NOTE_SAFE_BYTES = int(11.5 * 1024 * 1024)
 # Dumaloq -> to'rtburchak natijasining o'lchami (16:9)
 RECT_WIDTH = 1280
 RECT_HEIGHT = 720
 
-# Telegram bot yuklay oladigan eng katta fayl (50 MB chegara, biroz zapas bilan).
-MAX_SEND_MB = 49
+# Telegram bot yuklay oladigan eng katta fayl (50 MB chegara, biroz zapas
+# bilan). Local Bot API server ishlatilsa — 2 GB gacha.
+MAX_SEND_MB = _env_int("MAX_SEND_MB", 1900 if LOCAL_API else 49)
+# Katta faylni yuklash/yuklab olish uzoq davom etadi — kutish vaqti ham shunga
+# mos bo'lishi kerak, aks holda ulanish uzilib qoladi.
+SEND_TIMEOUT = _env_int("SEND_TIMEOUT", 3600 if LOCAL_API else 600)
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.16"
+BUILD_VERSION = "2026-11-10.19"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -164,6 +183,13 @@ BROADCAST_TTL = 900     # ommaviy xabarni tasdiqlash muddati (soniya)
 # to'qnashib, botning "osilib qolishiga" sabab bo'lardi.
 apihelper.CONNECT_TIMEOUT = 20
 apihelper.READ_TIMEOUT = 120
+
+# Local Bot API server bo'lsa barcha so'rovlar shu manzilga ketadi
+# (fayl yuklash/yuklab olish chegaralari olib tashlanadi).
+if LOCAL_API:
+    apihelper.API_URL = TELEGRAM_API_URL + "/bot{0}/{1}"
+    apihelper.FILE_URL = TELEGRAM_API_URL + "/file/bot{0}/{1}"
+    print(f"[API] local Bot API server: {TELEGRAM_API_URL}")
 
 bot = TeleBot(BOT_TOKEN or "0:invalid", threaded=True)
 BOT_USERNAME = ""
@@ -857,16 +883,85 @@ def detect_content_box(input_path):
     return out_w, out_h, out_x, out_y
 
 
+def stream_codecs(path):
+    """(video codec, audio codec) yoki None. Tez nusxalash uchun kerak."""
+    if not FFPROBE_PATH:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_PATH, "-v", "error",
+                "-show_entries", "stream=codec_type,codec_name",
+                "-of", "json", path,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        data = json.loads(result.stdout or "{}")
+        video = ""
+        audio = ""
+        for stream in data.get("streams") or []:
+            if stream.get("codec_type") == "video" and not video:
+                video = stream.get("codec_name") or ""
+            elif stream.get("codec_type") == "audio" and not audio:
+                audio = stream.get("codec_name") or ""
+        return video, audio
+    except Exception:
+        return None
+
+
+def can_remux(input_path, max_width=None, max_duration=None):
+    """Faylni qayta kodlamasdan yuborish mumkinmi (tez va sifat bir xil)."""
+    codecs = stream_codecs(input_path)
+    if not codecs:
+        return False
+    video, audio = codecs
+    if video != "h264" or audio not in ("aac", "mp3", ""):
+        return False
+    info = probe_video(input_path)
+    if not info:
+        return False
+    width, height, duration = info
+    if max_width and max(width, height) > max_width:
+        return False
+    if max_duration and duration > max_duration:
+        return False
+    return os.path.getsize(input_path) / (1024 * 1024) <= MAX_SEND_MB
+
+
+def remux_video(input_path, output_path):
+    """Qayta kodlashsiz nusxa: sifat aynan asl fayldagidek qoladi."""
+    run_ffmpeg([
+        FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c", "copy",
+        "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
+        output_path,
+    ])
+
+
 def make_square_video(input_path, output_path):
     """To'rtburchak videoni dumaloq (video note) uchun kvadratga keltiradi.
 
     MUHIM: Telegram video note'ni faqat kvadrat va o'lchami 640px dan
     kichik bo'lsa yaratadi; aks holda jimgina oddiy video qilib yuboradi
     (shu sabab "dumaloq bo'lmadi" muammosi chiqqan edi). Shuning uchun
-    natija doim 512x512 bo'ladi — bu dumaloq ko'rinish uchun yetarli
-    sifat (chatda 240-384px ko'rsatiladi).
+    natija doim 638x638 bo'ladi — bu video note uchun ruxsat etilgan eng
+    katta o'lcham (639px chegarasi), shu sabab sifat eng yuqori bo'ladi.
     O'rtasidan asl piksellarda qirqiladi, fps va ovoz asl holida qoladi.
     """
+    info = probe_video(input_path)
+    if info:
+        frame_w, frame_h, duration = info
+        square_source = abs(frame_w - frame_h) <= 2
+        # Manba allaqachon kvadrat, o'lchami yetarli va 59s dan qisqa bo'lsa
+        # qayta kodlash shart emas — fayl bir zumda tayyor bo'ladi va
+        # sifati asl holida qoladi.
+        if square_source and can_remux(input_path, max_width=SQUARE_SIZE, max_duration=59):
+            print("[SQUARE] qayta kodlanmaydi (tez nusxa)")
+            remux_video(input_path, output_path)
+            return
+
     box = detect_content_box(input_path)
     trim = ""
     if box:
@@ -896,21 +991,69 @@ def make_square_video(input_path, output_path):
         f"scale={SQUARE_SIZE}:{SQUARE_SIZE}:flags=lanczos,"  # video note chegarasi
         "setsar=1,format=yuv420p[v]"
     )
-    command = [
-        FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", input_path,
-        "-t", "59",                                      # video note chegarasi
-        "-map", "[v]", "-map", "0:a:0?",                 # audio bo'lmasa ham ishlaydi
-        "-filter_complex", filter_complex,
-        # veryfast + crf 17: o'lchovda "fast/crf18" dan ~3.5x tez,
-        # sifat deyarli bir xil (SSIM 0.9975 / 0.9980)
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-threads", "2",
-        "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
-        output_path,
+    duration = info[2] if info else 0
+
+    def build(rate_args, size):
+        square_filter = filter_complex
+        if size != SQUARE_SIZE:
+            square_filter = filter_complex.replace(
+                f"scale={SQUARE_SIZE}:{SQUARE_SIZE}:flags=lanczos,",
+                f"scale={size}:{size}:flags=lanczos,",
+            )
+        return [
+            FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path,
+            "-t", "59",                                  # video note chegarasi
+            "-map", "[v]", "-map", "0:a:0?",             # audio bo'lmasa ham ishlaydi
+            "-filter_complex", square_filter,
+            # veryfast + crf 17: o'lchovda "fast/crf18" dan ~3.5x tez,
+            # sifat deyarli bir xil (SSIM 0.9975 / 0.9980)
+            "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-threads", "2",
+            "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k",
+            "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
+            output_path,
+        ]
+
+    # 1-urinish: eng yaxshi sifat (crf 17). Kichik/qisqa videolar shu bilan
+    # 12 MB ichida qoladi va hech narsa yo'qotmaydi.
+    run_ffmpeg(build(["-crf", "17"], SQUARE_SIZE))
+    if os.path.getsize(output_path) <= NOTE_SAFE_BYTES:
+        return
+
+    # 2-urinish: hajm sig'madi — davomiylikka qarab bitrate hisoblab siqamiz.
+    # Kadr kesilmaydi: faqat sifat/hajm moslanadi, dumaloq videoning asosiy
+    # qismi to'liq saqlanadi.
+    seconds = max(1, min(duration or 59, 59))
+    total_kbps = (NOTE_SAFE_BYTES * 8 / 1000.0) / seconds
+    video_kbps = int(total_kbps - 96)
+    size = SQUARE_SIZE
+    if video_kbps < 600:
+        size = 512
+    if video_kbps < 350:
+        size = 384
+    video_kbps = max(180, video_kbps)
+    print(
+        f"[SQUARE] {os.path.getsize(output_path) / 1048576:.1f} MB — "
+        f"12 MB chegarasi uchun {video_kbps} kbps, {size}px ga siqiladi"
+    )
+    rate = [
+        "-b:v", f"{video_kbps}k",
+        "-maxrate", f"{int(video_kbps * 1.25)}k",
+        "-bufsize", f"{video_kbps * 2}k",
     ]
-    run_ffmpeg(command)
+    run_ffmpeg(build(rate, size))
+    if os.path.getsize(output_path) <= NOTE_SAFE_BYTES:
+        return
+
+    # 3-urinish: oxirgi zaxira — yana kichikroq o'lcham va past bitrate.
+    print("[SQUARE] hali ham katta — 384px, past bitrate bilan qayta siqiladi")
+    rate = [
+        "-b:v", "240k",
+        "-maxrate", "300k",
+        "-bufsize", "480k",
+    ]
+    run_ffmpeg(build(rate, 384))
 
 
 def make_rectangle_video(input_path, output_path):
@@ -920,8 +1063,16 @@ def make_rectangle_video(input_path, output_path):
     qo'shilmaydi. Kvadrat (dumaloq) video kvadrat holda, to'liq kadr bilan
     chiqadi; shu sababli Telegram uni dumaloq qilib ko'rsatmaydi.
     """
+    info = probe_video(input_path)
+    # Dumaloq videoni to'rtburchakka chiqarishda odatda hech qanday o'zgartirish
+    # kerak emas: fayl asl sifatida qoladi va darhol yuboriladi.
+    if info and max(info[0], info[1]) <= 1920 and can_remux(input_path, max_width=1920):
+        print("[RECT] qayta kodlanmaydi (tez nusxa)")
+        remux_video(input_path, output_path)
+        return
+
     video_filter = (
-        "scale=w='min(1280,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+        "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
         "setsar=1,format=yuv420p"
     )
     command = [
@@ -1178,7 +1329,10 @@ def start_conversion(message, kind):
         bot.reply_to(
             message,
             f"⚠️ Video juda katta ({size / 1024 / 1024:.1f} MB). "
-            f"Telegram botlar {MAX_INPUT_MB} MB gacha videoni yuklay oladi.",
+            f"Telegram botlar {MAX_INPUT_MB} MB gacha videoni yuklab oladi "
+            f"(bu Telegram chegarasi, botda sozlanmaydi).\n"
+            "Videoni telefonda kichikroq sifatda (720p) saqlab yoki qisqartirib "
+            "yuboring — natija baribir dumaloq va yengil chiqadi.",
         )
         return
 
@@ -1201,6 +1355,21 @@ def start_conversion(message, kind):
         raise
 
 
+def download_media(file_id, dest_path):
+    """Faylni Telegram'dan diskka oqim bilan yozadi.
+
+    bot.download_file() butun faylni xotiraga oladi — 100 MB+ videoda bu
+    serverni o'ldiradi. Shuning uchun bo'lak-bo'lak yozamiz.
+    """
+    file_info = bot.get_file(file_id)
+    url = apihelper.FILE_URL.format(bot.token, file_info.file_path)
+    with urllib.request.urlopen(url, timeout=SEND_TIMEOUT) as response:
+        with open(dest_path, "wb") as target:
+            shutil.copyfileobj(response, target, length=1024 * 512)
+    if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+        raise RuntimeError("faylni yuklab bo'lmadi")
+
+
 def conversion_job(message, kind, status_message_id):
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -1210,9 +1379,7 @@ def conversion_job(message, kind, status_message_id):
     output_path = os.path.join(workdir, "output.mp4")
 
     try:
-        file_info = bot.get_file(media.file_id)
-        with open(input_path, "wb") as target:
-            target.write(bot.download_file(file_info.file_path))
+        download_media(media.file_id, input_path)
 
         try:
             bot.send_chat_action(chat_id, "record_video_note" if kind == "to_note" else "upload_video")
@@ -1230,14 +1397,17 @@ def conversion_job(message, kind, status_message_id):
             raise RuntimeError("natija juda katta")
 
         if kind == "to_note":
+            note_info = probe_video(output_path)
+            note_length = note_info[0] if note_info else SQUARE_SIZE
+
             def send():
                 with open(output_path, "rb") as video_file:
                     return bot.send_video_note(
                         chat_id,
                         video_file,
-                        length=SQUARE_SIZE,  # fayl o'lchamiga mos bo'lishi shart
+                        length=note_length,  # fayl o'lchamiga mos bo'lishi shart
                         reply_to_message_id=message.message_id,
-                        timeout=600,
+                        timeout=SEND_TIMEOUT,
                     )
         else:
             # O'lcham va davomiylikni aniq beramiz — Telegram faylni dumaloq
@@ -1260,7 +1430,7 @@ def conversion_job(message, kind, status_message_id):
                         supports_streaming=True,
                         reply_markup=audio_keyboard(),
                         reply_to_message_id=message.message_id,
-                        timeout=600,
+                        timeout=SEND_TIMEOUT,
                         **video_kwargs,
                     )
 
@@ -1281,7 +1451,7 @@ def conversion_job(message, kind, status_message_id):
                         supports_streaming=True,
                         reply_markup=audio_keyboard(),
                         reply_to_message_id=message.message_id,
-                        timeout=600,
+                        timeout=SEND_TIMEOUT,
                     )
                 )
 
@@ -1319,9 +1489,7 @@ def audio_job(chat_id, user_id, video):
     input_path = os.path.join(workdir, "input.mp4")
     output_path = os.path.join(workdir, "audio.mp3")
     try:
-        file_info = bot.get_file(video.file_id)
-        with open(input_path, "wb") as target:
-            target.write(bot.download_file(file_info.file_path))
+        download_media(video.file_id, input_path)
 
         extract_audio_track(input_path, output_path)
 
@@ -1333,7 +1501,7 @@ def audio_job(chat_id, user_id, video):
                     audio_file,
                     caption=build_caption(),
                     title=title,
-                    timeout=600,
+                    timeout=SEND_TIMEOUT,
                 )
             )
     except ApiTelegramException as error:
@@ -2278,6 +2446,10 @@ def status_snapshot():
             "auto" if free_proxy_enabled() else "off"
         ),
         "free_proxy": _proxy_state["value"] or "",
+        # "local" bo'lsa 2 GB gacha fayl ishlaydi, "cloud" bo'lsa 20/50 MB
+        "api": "local" if LOCAL_API else "cloud",
+        "max_input_mb": MAX_INPUT_MB,
+        "max_send_mb": MAX_SEND_MB,
     }
     for key, getter in (
         ("users", count_users),
