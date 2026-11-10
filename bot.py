@@ -138,13 +138,14 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.3"
+BUILD_VERSION = "2026-11-10.4"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
 STATE = {
     "polling": False,
     "last_update": 0.0,
+    "last_poll_ok": 0.0,
     "conflicts_409": 0,
     "poll_restarts": 0,
     "last_poll_note": "",
@@ -1795,6 +1796,7 @@ def status_snapshot():
         "conflicts_409": STATE["conflicts_409"],
         "poll_restarts": STATE["poll_restarts"],
         "seconds_since_update": int(now - last) if last else None,
+        "seconds_since_poll_ok": int(now - (STATE["last_poll_ok"] or STARTED_AT)),
         "pending_updates": telegram_pending_count(),
         "ffmpeg": ffmpeg_ready(),
         "ffprobe": bool(FFPROBE_PATH),
@@ -1813,41 +1815,35 @@ def status_snapshot():
 
 
 def watchdog_loop():
-    """Polling qotib qolsa (yangilanish kelmaydi, lekin navbat o'ssa) qayta
-    ishga tushiradi va adminni ogohlantiradi. Socket uzilib qolgan holatlar
-    shu bilan o'z-o'zidan tuzaladi."""
+    """Polling umuman javob bermay qolsa adminni ogohlantiradi va logga yozadi.
+
+    Polling so'rovlarining o'zida qat'iy timeout bor, shuning uchun qotib
+    qolgan socket o'zi uziladi; bu nazorat esa tizimli muammoni erta
+    ko'rsatadi (masalan, Telegram bloklangan yoki token boshqa joyda).
+    """
     last_alert = 0.0
-    last_restart = 0.0
     while True:
         time.sleep(60)
         try:
-            last = STATE["last_update"] or STARTED_AT
+            last = STATE["last_poll_ok"] or STARTED_AT
             idle = time.time() - last
-            # 5 daqiqada bir martadan ko'p tiklamaymiz (keraksiz restart bo'lmasin)
-            if idle < 300 or time.time() - last_restart < 300:
+            if idle < 180:
                 continue
             pending = telegram_pending_count()
-            if not pending:
-                continue
             print(
-                f"[WATCHDOG] {int(idle)}s yangilanish kelmadi, navbatda {pending} ta "
-                f"— polling qayta ishga tushirilmoqda"
+                f"[WATCHDOG] {int(idle)}s davomida Telegramdan javob yo'q "
+                f"(navbatda {pending} ta) — sabab: {STATE['last_poll_note']}"
             )
-            STATE["poll_restarts"] += 1
-            last_restart = time.time()
-            try:
-                bot.stop_polling()
-            except Exception:
-                pass
             if time.time() - last_alert > 900:
                 last_alert = time.time()
                 for admin_id in ADMIN_IDS:
                     try:
                         bot.send_message(
                             admin_id,
-                            "⚠️ Bot yangilanishlarni olmay qoldi "
+                            "⚠️ Bot Telegramdan yangilanish olmayapti "
                             f"({int(idle // 60)} daqiqa, navbatda {pending} ta).\n"
-                            f"Polling qayta ishga tushirildi. [BUILD {BUILD_VERSION}]",
+                            f"Sabab: {STATE['last_poll_note']}\n"
+                            f"Holat: /status [BUILD {BUILD_VERSION}]",
                         )
                     except Exception:
                         pass
@@ -1934,19 +1930,6 @@ def main():
     threading.Thread(target=watchdog_loop, daemon=True).start()
     print("Watchdog ishga tushdi (qotib qolgan pollingni o'zi tiklaydi).")
 
-    # Telebot xatosini yozib qo'yadi va polling'ni to'xtatadi (o'zi qayta
-    # urinmaydi) — sababni pastdagi tsikl hal qiladi.
-    class _PollingErrorTracker:
-        def __init__(self):
-            self.last_error = None
-
-        def handle(self, exception) -> bool:  # True -> telebot o'zi "yutadi"
-            self.last_error = exception
-            return False
-
-    polling_errors = _PollingErrorTracker()
-    bot.exception_handler = polling_errors
-
     try:
         bot.remove_webhook()
     except Exception as error:
@@ -2020,51 +2003,68 @@ def main():
             print(f"[BOOT] xabar yuborilmadi: {error}")
 
     print(f"Bot muvaffaqiyatli ishga tushdi... [BUILD {BUILD_VERSION}]")
-    # 409 Conflict: bir xil token bilan ikkinchi nusxa bot ishlayotgan bo'lsa
-    # Telegram shu xatoni beradi (Render'da eski va yangi deploy bir necha
-    # soniya birga ishlaydi — shundan ham bo'ladi).
-    # MUHIM: `none_stop=True` berilmaydi — u holda telebot xatoni o'zi yutib,
-    # 60 soniyagacha kutib ichida qayta urinadi va loglarni "Threaded polling
-    # exception" bilan to'ldiradi. non_stop=False bo'lsa polling to'xtaydi va
-    # sababni o'zimiz to'g'ri hal qilamiz.
+
+    # Polling ATAYIN qo'lda yozilgan (telebot'ning infinity_polling'i o'rniga):
+    # 1) har bir so'rovda qat'iy timeout bor — socket jim qotib qolmaydi;
+    # 2) nima bo'layotgani logda va /status da ko'rinadi;
+    # 3) 409 / 401 / tarmoq xatolari aniq hal qilinadi.
+    # Telebot'ning ichki polling'ida timeout yo'qligi sabab jarayon "polling
+    # ishlayapti" deb turib, Telegramdan birorta yangilanish olmay qolgan edi.
+    offset = None
     while True:
-        polling_errors.last_error = None
         STATE["polling"] = True
         try:
-            bot.infinity_polling(
-                timeout=60,
-                long_polling_timeout=60,
-                skip_pending=False,   # qayta ishga tushganda kelgan xabarlar yo'qolmasin
-                non_stop=False,
-                logger_level=None,    # loglar bizning [POLL] qatorlarimiz orqali
+            updates = bot.get_updates(
+                offset=offset,
+                timeout=30,                 # long polling (server tomonda kutish)
                 allowed_updates=ALLOWED_UPDATES,
+                request_timeout=(15, 45),    # (ulanish, o'qish) — qat'iy chegarasi
             )
         except ApiTelegramException as error:
-            polling_errors.last_error = error
-        except Exception as error:  # noqa: BLE001 - bot hech qachon o'chmasin
-            polling_errors.last_error = error
-            traceback.print_exc()
-
-        STATE["polling"] = False
-        error = polling_errors.last_error
-        code = getattr(error, "error_code", None)
-        STATE["last_poll_note"] = str(error)[:120] if error else "to'xtadi"
-        if code == 409:
-            STATE["conflicts_409"] += 1
-        if code in (401, 404):
-            print(f"[POLL] Token qabul qilinmadi ({code}). To'xtatildi.")
-            sys.exit(1)
-        if code == 409:
-            print(
-                "[POLL] 409 Conflict: bu token bilan boshqa nusxa bot ishlayapti.\n"
-                "       Render'da eski deploy hali o'chmagan bo'lishi mumkin, yoki\n"
-                "       kompyuterda/boshqa serverda bot.py ochiq qolgan.\n"
-                "       25 soniyadan keyin qayta urinish..."
-            )
-            time.sleep(25)
-        else:
-            print(f"[POLL] Polling to'xtadi: {error}. 5 soniyadan keyin qayta...")
+            code = getattr(error, "error_code", None)
+            STATE["last_poll_note"] = f"{code}: {str(error)[:100]}"
+            if code == 409:
+                STATE["conflicts_409"] += 1
+                print(
+                    "[POLL] 409 Conflict: bu token bilan boshqa nusxa bot ishlayapti.\n"
+                    "       Render'da eski deploy hali o'chmagan bo'lishi mumkin, yoki\n"
+                    "       kompyuterda/boshqa serverda bot.py ochiq qolgan."
+                )
+                time.sleep(20)
+                if STATE["conflicts_409"] in (1, 5, 20):
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            bot.send_message(
+                                admin_id,
+                                "⚠️ 409 Conflict: bot tokeni bilan boshqa nusxa "
+                                "ishlayapti. Eski deployni to'xtating.",
+                            )
+                        except Exception:
+                            pass
+                continue
+            if code in (401, 404):
+                print(f"[POLL] Token qabul qilinmadi ({code}). To'xtatildi.")
+                sys.exit(1)
+            print(f"[POLL] Telegram xatosi {code}: {error}. 5 s dan keyin qayta...")
             time.sleep(5)
+            continue
+        except Exception as error:  # noqa: BLE001 - bot hech qachon o'chmasin
+            STATE["last_poll_note"] = f"tarmoq: {str(error)[:100]}"
+            print(f"[POLL] Tarmoq xatosi: {error}. 5 s dan keyin qayta...")
+            time.sleep(5)
+            continue
+
+        STATE["last_poll_ok"] = time.time()
+        STATE["last_poll_note"] = f"ok ({len(updates)} ta)"
+        if not updates:
+            continue
+
+        offset = updates[-1].update_id + 1
+        print(f"[POLL] {len(updates)} ta yangilanish olindi (offset={offset})")
+        try:
+            bot.process_new_updates(updates)
+        except Exception:
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
