@@ -132,13 +132,16 @@ ALLOWED_UPDATES = [
 # Dumaloq video (video note) o'lchami. Telegram 640px dan katta kvadratni
 # video note qilib qabul qilmaydi — oddiy video qilib yuboradi.
 SQUARE_SIZE = 512
+# Dumaloq -> to'rtburchak natijasining o'lchami (16:9)
+RECT_WIDTH = 1280
+RECT_HEIGHT = 720
 
 # Telegram bot yuklay oladigan eng katta fayl (50 MB chegara, biroz zapas bilan).
 MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.6"
+BUILD_VERSION = "2026-11-10.7"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -771,19 +774,28 @@ def make_square_video(input_path, output_path):
 
 
 def make_rectangle_video(input_path, output_path):
-    """Dumaloq (kvadrat) videoni oddiy (to'rtburchak) videoga aylantiradi.
+    """Dumaloq (kvadrat) videoni to'liq 16:9 to'rtburchakka aylantiradi.
 
-    KESISH YO'Q: avval 16:9 ga qirqilardi va tepa qismi (bosh, yuz)
-    kesilib qolardi. Endi kadr 100% saqlanadi — kvadrat note o'z
-    mutanosibligida (kvadrat video sifatida) chiqadi, yon tomonlarga
-    xira fon ham qo'yilmaydi. Shu bilan hech qanday detal yo'qolmaydi.
+    KESISH YO'Q va BO'SH CHEKKA YO'Q: kadr 100% saqlanadi (o'rtada o'tkir
+    video), chetlari esa shu videoning xiralashtirilgan kattalashtirilgan
+    nusxasi bilan to'ldiriladi. Shuning uchun ramka to'liq video bilan
+    qoplanadi — qora chiziqlar chiqmaydi.
     """
+    width, height = RECT_WIDTH, RECT_HEIGHT
+    filter_complex = (
+        # fon: kadrni to'liq qoplab, ortiqchasini kesib, kuchli xiralashtirish
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},gblur=sigma=25,eq=brightness=-0.06[bg];"
+        # asosiy video: to'liq kadr, o'rtaga qo'yiladi
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease:"
+        f"flags=lanczos[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[v]"
+    )
     command = [
         FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
-        "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", "scale=w='min(1280,trunc(iw/2)*2)':h=-2:flags=lanczos,"
-        "setsar=1,format=yuv420p",
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", "0:a:0?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-threads", "2",
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
@@ -1255,8 +1267,29 @@ def extract_url(text):
     return match.group(0).rstrip(").,>\"'")
 
 
-def download_by_url(url, workdir):
-    """Havoladan videoni yuklaydi va (fayl yo'li, sarlavha) qaytaradi."""
+def yt_cookies_file():
+    """YouTube bot tekshiruvini yengish uchun cookies fayli (bo'lsa)."""
+    for path in (
+        os.environ.get("YT_COOKIES_FILE", ""),
+        "/etc/secrets/cookies.txt",
+        os.path.join(BASE_DIR, "cookies.txt"),
+        os.path.join(BASE_DIR, "youtube_cookies.txt"),
+    ):
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
+def is_youtube_url(url):
+    return "youtube.com" in url or "youtu.be" in url
+
+
+# YouTube datacenter IP'larni tekshiradi; bitta mijoz ishlamasa boshqasini
+# sinab ko'ramiz (cookies fayli bo'lsa ko'pi bilan birinchisi yetadi).
+YOUTUBE_CLIENTS = ("default", "web_safari", "tv", "android_vr")
+
+
+def _yt_options(url, workdir, client=None):
     options = {
         "outtmpl": os.path.join(workdir, "%(title).80B.%(ext)s"),
         "format": (
@@ -1277,9 +1310,46 @@ def download_by_url(url, workdir):
     folder = os.path.dirname(FFMPEG_PATH or "")
     if folder and os.path.isdir(folder):
         options["ffmpeg_location"] = folder
+    cookies = yt_cookies_file()
+    if cookies:
+        options["cookiefile"] = cookies
+    if client and client != "default":
+        options["extractor_args"] = {"youtube": {"player_client": [client]}}
+    return options
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
+
+def _is_bot_check(error):
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "sign in to confirm",
+            "failed to extract",
+            "confirm you’re not a bot",
+            "confirm you're not a bot",
+            "player response",
+            "http error 429",
+        )
+    )
+
+
+def download_by_url(url, workdir):
+    """Havoladan videoni yuklaydi va (fayl yo'li, sarlavha) qaytaradi."""
+    clients = YOUTUBE_CLIENTS if is_youtube_url(url) else ("default",)
+    info = None
+    last_error = None
+    for client in clients:
+        try:
+            with yt_dlp.YoutubeDL(_yt_options(url, workdir, client)) as ydl:
+                info = ydl.extract_info(url, download=True)
+            break
+        except Exception as error:  # noqa: BLE001 - mijozni almashtirib ko'ramiz
+            last_error = error
+            if not _is_bot_check(error):
+                raise
+            print(f"[YTDLP] {client} mijozida bloklandi, keyingisiga o'tamiz")
+    if info is None:
+        raise last_error or RuntimeError("havoladan video topilmadi")
 
     # Merge bo'lsa kengaytma o'zgaradi — papkadagi eng katta faylni olamiz.
     files = [
@@ -1403,7 +1473,13 @@ def link_job(message, url, status_message_id):
                 "❌ Bu video yopiq (private) yoki login talab qiladi — "
                 "uni yuklab bo'lmadi."
             )
-        elif "sign in" in lowered or "bot" in lowered and "confirm" in lowered:
+        elif is_youtube_url(url) and _is_bot_check(reason):
+            text = (
+                "❌ YouTube bu videoni serverdan yuklashga ruxsat bermadi "
+                "(bot tekshiruvi).\n"
+                "Video faylini to'g'ridan-to'g'ri yuborsangiz, konvertatsiya "
+                "ishlaydi."
+            )
             text = (
                 "❌ YouTube bu videoni serverga berishdan bosh tortdi "
                 "(login tekshiruvi). Boshqa havola bilan urinib ko'ring."
