@@ -29,6 +29,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from telebot import TeleBot, apihelper, types
 from telebot.apihelper import ApiTelegramException
 
+# Render'da stdout blok bilan buferlanadi va print() qatorlari logda kechroq
+# (yoki umuman) ko'rinmaydi. Qator-bufer rejimi loglarni darhol ko'rsatadi.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:  # pragma: no cover
+    pass
+
 # Firebase (Firestore) — ma'lumotlar bulutda saqlanadi. Kutubxona yo'q bo'lsa
 # bot SQLite bilan ishlayveradi, shuning uchun import ixtiyoriy.
 try:
@@ -130,7 +138,17 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10"
+BUILD_VERSION = "2026-11-10.3"
+
+# Diagnostika: /status endpoint va watchdog uchun jonli holat.
+STARTED_AT = time.time()
+STATE = {
+    "polling": False,
+    "last_update": 0.0,
+    "conflicts_409": 0,
+    "poll_restarts": 0,
+    "last_poll_note": "",
+}
 
 PORT = _env_int("PORT", 8080)
 STEP_TTL = 600          # admin amallari uchun kutish vaqti (soniya)
@@ -342,6 +360,7 @@ init_firestore()
 def add_user(user_id, username=None, first_name=None):
     """Foydalanuvchini saqlaydi/yangilaydi (blokdan chiqaradi)."""
     user_id = int(user_id)
+    mark_update()
     if firestore_enabled():
         try:
             data = {
@@ -1428,6 +1447,7 @@ def callback_listener(call):
 def handle_callback(call):
     data = call.data or ""
     user_id = call.from_user.id
+    mark_update()
 
     if data == "check_sub":
         if check_subscription(user_id):
@@ -1739,12 +1759,117 @@ def on_del_channel(message):
         )
 
 
+# --- DIAGNOSTIKA VA WATCHDOG ---
+_pending_cache = {"time": 0.0, "value": None}
+
+
+def mark_update():
+    """Oxirgi yangilanish qachon kelganini yozib qo'yadi (watchdog uchun)."""
+    STATE["last_update"] = time.time()
+
+
+def telegram_pending_count():
+    """Telegram navbatida kutayotgan yangilanishlar soni (10 s kesh)."""
+    now = time.time()
+    if now - _pending_cache["time"] < 10:
+        return _pending_cache["value"]
+    try:
+        info = bot.get_webhook_info()
+        value = getattr(info, "pending_update_count", None)
+    except Exception:
+        value = None
+    _pending_cache.update(time=now, value=value)
+    return value
+
+
+def status_snapshot():
+    """Bot holati — /status endpoint va /status buyrug'i uchun."""
+    now = time.time()
+    last = STATE["last_update"]
+    data = {
+        "build": BUILD_VERSION,
+        "bot": BOT_USERNAME or None,
+        "uptime_sec": int(now - STARTED_AT),
+        "polling": STATE["polling"],
+        "last_poll_note": STATE["last_poll_note"],
+        "conflicts_409": STATE["conflicts_409"],
+        "poll_restarts": STATE["poll_restarts"],
+        "seconds_since_update": int(now - last) if last else None,
+        "pending_updates": telegram_pending_count(),
+        "ffmpeg": ffmpeg_ready(),
+        "ffprobe": bool(FFPROBE_PATH),
+        "yt_dlp": YTDLP_LIB,
+    }
+    for key, getter in (
+        ("users", count_users),
+        ("channels", lambda: len(get_channels())),
+        ("firestore", firestore_enabled),
+    ):
+        try:
+            data[key] = getter()
+        except Exception as error:
+            data[key] = f"xato: {error}"
+    return data
+
+
+def watchdog_loop():
+    """Polling qotib qolsa (yangilanish kelmaydi, lekin navbat o'ssa) qayta
+    ishga tushiradi va adminni ogohlantiradi. Socket uzilib qolgan holatlar
+    shu bilan o'z-o'zidan tuzaladi."""
+    last_alert = 0.0
+    last_restart = 0.0
+    while True:
+        time.sleep(60)
+        try:
+            last = STATE["last_update"] or STARTED_AT
+            idle = time.time() - last
+            # 5 daqiqada bir martadan ko'p tiklamaymiz (keraksiz restart bo'lmasin)
+            if idle < 300 or time.time() - last_restart < 300:
+                continue
+            pending = telegram_pending_count()
+            if not pending:
+                continue
+            print(
+                f"[WATCHDOG] {int(idle)}s yangilanish kelmadi, navbatda {pending} ta "
+                f"— polling qayta ishga tushirilmoqda"
+            )
+            STATE["poll_restarts"] += 1
+            last_restart = time.time()
+            try:
+                bot.stop_polling()
+            except Exception:
+                pass
+            if time.time() - last_alert > 900:
+                last_alert = time.time()
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(
+                            admin_id,
+                            "⚠️ Bot yangilanishlarni olmay qoldi "
+                            f"({int(idle // 60)} daqiqa, navbatda {pending} ta).\n"
+                            f"Polling qayta ishga tushirildi. [BUILD {BUILD_VERSION}]",
+                        )
+                    except Exception:
+                        pass
+        except Exception as error:  # watchdog hech qachon o'chmasin
+            print(f"[WATCHDOG] xato: {error}")
+
+
 # --- RENDER UCHUN HEALTH-CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"Bot is alive and running 24/7!"
+        if self.path.startswith("/status"):
+            try:
+                payload = json.dumps(status_snapshot(), ensure_ascii=False, indent=1)
+            except Exception as error:
+                payload = json.dumps({"error": str(error)})
+            body = payload.encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        else:
+            body = b"Bot is alive and running 24/7!"
+            ctype = "text/plain; charset=utf-8"
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1756,6 +1881,30 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def run_health_server():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
     server.serve_forever()
+
+
+@bot.message_handler(commands=["status"], chat_types=["private"])
+def status_handler(message):
+    if not is_admin(message.from_user.id):
+        return
+    data = status_snapshot()
+    lines = [
+        "🩺 <b>Bot holati</b>",
+        f"▪️ Build: <code>{data['build']}</code>",
+        f"▪️ Bot: @{data['bot'] or '-'}",
+        f"▪️ Ishlagan vaqt: {data['uptime_sec'] // 60} daq",
+        f"▪️ Polling: {'✅' if data['polling'] else '❌'} "
+        f"({data['last_poll_note'] or '-'})",
+        f"▪️ 409 konflikt: {data['conflicts_409']}, qayta ishga tushirish: {data['poll_restarts']}",
+        f"▪️ Navbatda: {data['pending_updates']} ta yangilanish",
+        f"▪️ Oxirgi xabar: {data['seconds_since_update']} s oldin",
+        f"▪️ Foydalanuvchilar: {data['users']} | Kanallar: {data['channels']}",
+        f"▪️ Firestore: {data['firestore']} | yt-dlp: {data['yt_dlp']}",
+    ]
+    try:
+        bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
+    except Exception:
+        bot.send_message(message.chat.id, "\n".join(lines).replace("<", ""))
 
 
 # --- MAIN ---
@@ -1782,6 +1931,8 @@ def main():
 
     threading.Thread(target=run_health_server, daemon=True).start()
     print(f"Health-check server {PORT}-portda ishga tushdi.")
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+    print("Watchdog ishga tushdi (qotib qolgan pollingni o'zi tiklaydi).")
 
     # Telebot xatosini yozib qo'yadi va polling'ni to'xtatadi (o'zi qayta
     # urinmaydi) — sababni pastdagi tsikl hal qiladi.
@@ -1829,6 +1980,7 @@ def main():
                         types.BotCommand("admin", "Admin panel"),
                         types.BotCommand("id", "Mening ID raqamim"),
                         types.BotCommand("cancel", "Amalni bekor qilish"),
+                        types.BotCommand("status", "Bot holati"),
                     ],
                     scope=types.BotCommandScopeChat(admin_id),
                 )
@@ -1851,6 +2003,22 @@ def main():
     except Exception as error:
         print(f"[DESCRIPTION] {error}")
 
+    # Admin deploydan keyin darhol bilishi uchun (sendMessage getUpdates'ga
+    # bog'liq emas — polling qotib qolsa ham yetib boradi).
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                "✅ <b>Bot ishga tushdi</b>\n"
+                f"▪️ Build: <code>{BUILD_VERSION}</code>\n"
+                f"▪️ Bot: @{BOT_USERNAME or '-'}\n"
+                f"▪️ Holatni ko'rish: /status",
+                parse_mode="HTML",
+            )
+            break
+        except Exception as error:
+            print(f"[BOOT] xabar yuborilmadi: {error}")
+
     print(f"Bot muvaffaqiyatli ishga tushdi... [BUILD {BUILD_VERSION}]")
     # 409 Conflict: bir xil token bilan ikkinchi nusxa bot ishlayotgan bo'lsa
     # Telegram shu xatoni beradi (Render'da eski va yangi deploy bir necha
@@ -1861,6 +2029,7 @@ def main():
     # sababni o'zimiz to'g'ri hal qilamiz.
     while True:
         polling_errors.last_error = None
+        STATE["polling"] = True
         try:
             bot.infinity_polling(
                 timeout=60,
@@ -1876,8 +2045,12 @@ def main():
             polling_errors.last_error = error
             traceback.print_exc()
 
+        STATE["polling"] = False
         error = polling_errors.last_error
         code = getattr(error, "error_code", None)
+        STATE["last_poll_note"] = str(error)[:120] if error else "to'xtadi"
+        if code == 409:
+            STATE["conflicts_409"] += 1
         if code in (401, 404):
             print(f"[POLL] Token qabul qilinmadi ({code}). To'xtatildi.")
             sys.exit(1)
