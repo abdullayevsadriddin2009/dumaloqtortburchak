@@ -143,7 +143,7 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.14"
+BUILD_VERSION = "2026-11-10.16"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -736,6 +736,127 @@ def extract_audio_track(input_path, output_path):
         raise RuntimeError("bu videoda ovoz (audio) yo'q")
 
 
+def _frame_pixels(input_path, target_w=160):
+    """Videodan bitta kadrni kichik o'lchamda RGB baytlar sifatida oladi."""
+    command = [
+        FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-ss", "1", "-i", input_path, "-frames:v", "1",
+        "-vf", "scale=%d:-2" % target_w,
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=60)
+    except Exception:
+        return None
+    data = result.stdout or b""
+    row = target_w * 3
+    height = len(data) // row
+    if height < 8:
+        return None
+    return data[: height * row], target_w, height
+
+
+def _is_flat(data, width, x0, y0, step_x, step_y, count, color, tol=22):
+    for i in range(count):
+        offset = ((y0 + step_y * i) * width + (x0 + step_x * i)) * 3
+        if (
+            abs(data[offset] - color[0]) > tol
+            or abs(data[offset + 1] - color[1]) > tol
+            or abs(data[offset + 2] - color[2]) > tol
+        ):
+            return False
+    return True
+
+
+def detect_content_box(input_path):
+    """Videodagi bo'sh hoshiyani (qora, oq yoki bir xil rangli) topadi.
+
+    Telegram dumaloq video kvadrat bo'lishi shart. Agar yuborilgan videoda
+    atrofi bir xil rangli hoshiya bo'lsa (masalan oq fonda kichik doira),
+    oddiy markazdan kesish hoshiyani ham qoldirib yuboradi va dumaloq ichida
+    bo'sh joy ko'rinadi. Shuning uchun chetlardan bir xil rangli chiziqlarni
+    ichkariga qarab sanaymiz va faqat haqiqiy rasm maydonini qoldiramiz.
+
+    Qaytaradi: (w, h, x, y) yoki None (hoshiya topilmasa / ishonchsiz bo'lsa).
+    """
+    frame = _frame_pixels(input_path)
+    info = probe_video(input_path)
+    if not frame or not info:
+        return None
+    data, width, height = frame
+    frame_w, frame_h = info[0], info[1]
+    if frame_w < 32 or frame_h < 32:
+        return None
+
+    limit = int(min(width, height) * 0.45)
+
+    def color_at(x, y):
+        offset = (y * width + x) * 3
+        return data[offset], data[offset + 1], data[offset + 2]
+
+    top = 0
+    top_color = color_at(0, 0)
+    while top < limit and _is_flat(data, width, 0, top, 1, 0, width, top_color):
+        top += 1
+
+    bottom = 0
+    bottom_color = color_at(width - 1, height - 1)
+    while bottom < limit and _is_flat(
+        data, width, 0, height - 1 - bottom, 1, 0, width, bottom_color
+    ):
+        bottom += 1
+
+    left = 0
+    inner_h = max(1, height - top - bottom)
+    left_color = color_at(0, top)
+    while left < limit and _is_flat(
+        data, width, left, top, 0, 1, inner_h, left_color
+    ):
+        left += 1
+
+    right = 0
+    right_color = color_at(width - 1, top)
+    while right < limit and _is_flat(
+        data, width, width - 1 - right, top, 0, 1, inner_h, right_color
+    ):
+        right += 1
+
+    # Kichik o'lchamda hisoblash bir-ikki piksel xato beradi; hoshiya
+    # qoldig'i ko'rinmasligi uchun har tomondan biroz ichkariga olamiz.
+    inset = 2
+    if left > inset:
+        left += inset
+    if right > inset:
+        right += inset
+    if top > inset:
+        top += inset
+    if bottom > inset:
+        bottom += inset
+
+    box_w = width - left - right
+    box_h = height - top - bottom
+    if box_w < 8 or box_h < 8:
+        return None
+    if left <= 1 and right <= 1 and top <= 1 and bottom <= 1:
+        return None  # hoshiya yo'q
+
+    keeps_area = (box_w * box_h) / float(width * height)
+    if keeps_area < 0.25:
+        return None  # juda ko'p kesilyapti — ishonchsiz
+
+    scale_x = frame_w / float(width)
+    scale_y = frame_h / float(height)
+    out_w = max(16, int(round(box_w * scale_x)) // 2 * 2)
+    out_h = max(16, int(round(box_h * scale_y)) // 2 * 2)
+    out_x = max(0, int(round(left * scale_x)) // 2 * 2)
+    out_y = max(0, int(round(top * scale_y)) // 2 * 2)
+    if out_x + out_w > frame_w:
+        out_x = max(0, frame_w - out_w)
+    if out_y + out_h > frame_h:
+        out_y = max(0, frame_h - out_h)
+    return out_w, out_h, out_x, out_y
+
+
 def make_square_video(input_path, output_path):
     """To'rtburchak videoni dumaloq (video note) uchun kvadratga keltiradi.
 
@@ -746,11 +867,28 @@ def make_square_video(input_path, output_path):
     sifat (chatda 240-384px ko'rsatiladi).
     O'rtasidan asl piksellarda qirqiladi, fps va ovoz asl holida qoladi.
     """
+    box = detect_content_box(input_path)
+    trim = ""
+    if box:
+        box_w, box_h, box_x, box_y = box
+        info = probe_video(input_path)
+        if info:
+            frame_w, frame_h = info[0], info[1]
+            # Faqat ishonchli holatda kesamiz: hoshiya bor, lekin rasm
+            # maydoni juda kichrayib ketmagan bo'lsa.
+            keeps_area = (box_w * box_h) / float(frame_w * frame_h)
+            if keeps_area >= 0.4 and (box_w < frame_w or box_h < frame_h):
+                trim = f"crop={box_w}:{box_h}:{box_x}:{box_y},"
+                print(
+                    f"[SQUARE] hoshiya kesiladi: {frame_w}x{frame_h} -> "
+                    f"{box_w}x{box_h}"
+                )
     filter_complex = (
+        "[0:v]" + trim +
         # 1) SAR (piksel nisbati) 1:1 ga keltiriladi. Ba'zi videolar 16:15,
         #    2:1 kabi nisbat bilan keladi — ular normallashtirilmasa natija
         #    cho'zilgan/toraytirilgan ("2 xil") ko'rinishda chiqadi.
-        "[0:v]scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1,"
+        "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1,"
         # 2) Markazdan kvadrat qirqish — kadr dumaloqni to'liq to'ldiradi,
         #    qora hoshiya yoki kichraytirilgan kadr bo'lmaydi. O'lcham juft
         #    qilinadi (toq piksel ba'zi o'lchamlarda xato beradi).
