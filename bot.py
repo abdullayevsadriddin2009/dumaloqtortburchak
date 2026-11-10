@@ -909,7 +909,7 @@ def stream_codecs(path):
         return None
 
 
-def can_remux(input_path, max_width=None, max_duration=None):
+def can_remux(input_path, max_width=None, max_duration=None, max_bytes=None):
     """Faylni qayta kodlamasdan yuborish mumkinmi (tez va sifat bir xil)."""
     codecs = stream_codecs(input_path)
     if not codecs:
@@ -925,7 +925,10 @@ def can_remux(input_path, max_width=None, max_duration=None):
         return False
     if max_duration and duration > max_duration:
         return False
-    return os.path.getsize(input_path) / (1024 * 1024) <= MAX_SEND_MB
+    # Dumaloq video uchun 12 MB chegarasi qat'iy: undan katta faylni
+    # nusxalab bo'lmaydi, qayta kodlash shart.
+    limit = max_bytes if max_bytes else MAX_SEND_MB * 1024 * 1024
+    return os.path.getsize(input_path) <= limit
 
 
 def remux_video(input_path, output_path):
@@ -957,7 +960,12 @@ def make_square_video(input_path, output_path):
         # Manba allaqachon kvadrat, o'lchami yetarli va 59s dan qisqa bo'lsa
         # qayta kodlash shart emas — fayl bir zumda tayyor bo'ladi va
         # sifati asl holida qoladi.
-        if square_source and can_remux(input_path, max_width=SQUARE_SIZE, max_duration=59):
+        if square_source and can_remux(
+            input_path,
+            max_width=SQUARE_SIZE,
+            max_duration=59,
+            max_bytes=NOTE_SAFE_BYTES,
+        ):
             print("[SQUARE] qayta kodlanmaydi (tez nusxa)")
             remux_video(input_path, output_path)
             return
@@ -1025,35 +1033,37 @@ def make_square_video(input_path, output_path):
     # Kadr kesilmaydi: faqat sifat/hajm moslanadi, dumaloq videoning asosiy
     # qismi to'liq saqlanadi.
     seconds = max(1, min(duration or 59, 59))
-    total_kbps = (NOTE_SAFE_BYTES * 8 / 1000.0) / seconds
-    video_kbps = int(total_kbps - 96)
-    size = SQUARE_SIZE
-    if video_kbps < 600:
-        size = 512
-    if video_kbps < 350:
-        size = 384
-    video_kbps = max(180, video_kbps)
-    print(
-        f"[SQUARE] {os.path.getsize(output_path) / 1048576:.1f} MB — "
-        f"12 MB chegarasi uchun {video_kbps} kbps, {size}px ga siqiladi"
-    )
-    rate = [
-        "-b:v", f"{video_kbps}k",
-        "-maxrate", f"{int(video_kbps * 1.25)}k",
-        "-bufsize", f"{video_kbps * 2}k",
-    ]
-    run_ffmpeg(build(rate, size))
-    if os.path.getsize(output_path) <= NOTE_SAFE_BYTES:
-        return
+    video_kbps = int((NOTE_SAFE_BYTES * 8 / 1000.0) / seconds - 96)
 
-    # 3-urinish: oxirgi zaxira — yana kichikroq o'lcham va past bitrate.
-    print("[SQUARE] hali ham katta — 384px, past bitrate bilan qayta siqiladi")
-    rate = [
-        "-b:v", "240k",
-        "-maxrate", "300k",
-        "-bufsize", "480k",
-    ]
-    run_ffmpeg(build(rate, 384))
+    # Natija haqiqatan 12 MB dan kichik bo'lguncha siqamiz. Har safar
+    # o'lchangan natijaga qarab keyingi bitrate'ni tuzatamiz — shuning uchun
+    # bu cheksiz "taxmin" emas, aniq tekshiruv.
+    size = SQUARE_SIZE
+    for attempt in range(4):
+        if video_kbps < 600:
+            size = 512
+        if video_kbps < 350:
+            size = 384
+        video_kbps = max(120, int(video_kbps))
+        print(
+            f"[SQUARE] {os.path.getsize(output_path) / 1048576:.1f} MB — "
+            f"12 MB chegarasi uchun {video_kbps} kbps, {size}px ga siqiladi "
+            f"({attempt + 1}-urinish)"
+        )
+        rate = [
+            "-b:v", f"{video_kbps}k",
+            "-maxrate", f"{int(video_kbps * 1.25)}k",
+            "-bufsize", f"{video_kbps * 2}k",
+        ]
+        run_ffmpeg(build(rate, size))
+        current = os.path.getsize(output_path)
+        if current <= NOTE_SAFE_BYTES:
+            return
+        # Necha marta oshib ketganiga qarab keyingi bitrate'ni kamaytiramiz.
+        overshoot = current / float(NOTE_SAFE_BYTES)
+        video_kbps = int(video_kbps / max(1.05, overshoot) * 0.9)
+
+    raise RuntimeError("dumaloq video 12 MB chegarasiga sig'madi")
 
 
 def make_rectangle_video(input_path, output_path):
