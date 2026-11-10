@@ -141,7 +141,7 @@ MAX_SEND_MB = 49
 AUDIO_CALLBACK = "extract_audio"
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.11"
+BUILD_VERSION = "2026-11-10.12"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1350,7 +1350,14 @@ def is_youtube_url(url):
 
 # YouTube datacenter IP'larni tekshiradi; bitta mijoz ishlamasa boshqasini
 # sinab ko'ramiz (cookies fayli bo'lsa ko'pi bilan birinchisi yetadi).
-YOUTUBE_CLIENTS = ("default", "web_safari", "tv", "android_vr")
+YOUTUBE_CLIENTS = ("default", "mweb", "web_safari", "web_embedded", "tv", "android_vr")
+
+
+def yt_proxy():
+    """Ixtiyoriy proxy: YT_PROXY (masalan http://user:pass@host:port yoki
+    socks5://host:port). YouTube datacenter IP'larni bloklaydi — proxy
+    bo'lsa yuklash odatda ishlaydi."""
+    return _env("YT_PROXY") or _env("YOUTUBE_PROXY") or ""
 
 
 def _yt_options(url, workdir, client=None):
@@ -1375,6 +1382,9 @@ def _yt_options(url, workdir, client=None):
     folder = os.path.dirname(FFMPEG_PATH or "")
     if folder and os.path.isdir(folder):
         options["ffmpeg_location"] = folder
+    proxy = yt_proxy()
+    if proxy:
+        options["proxy"] = proxy
     cookies = yt_cookies_file()
     if cookies:
         # Render "Secret Files" faqat o'qish uchun mount qilinadi, yt-dlp esa
@@ -1971,6 +1981,7 @@ def status_snapshot():
         "ffprobe": bool(FFPROBE_PATH),
         "yt_dlp": YTDLP_LIB,
         "cookies": bool(yt_cookies_file()),
+        "proxy": bool(yt_proxy()),
     }
     for key, getter in (
         ("users", count_users),
@@ -2089,6 +2100,8 @@ def status_handler(message):
         f"▪️ Oxirgi xabar: {data['seconds_since_update']} s oldin",
         f"▪️ Foydalanuvchilar: {data['users']} | Kanallar: {data['channels']}",
         f"▪️ Firestore: {data['firestore']} | yt-dlp: {data['yt_dlp']}",
+        f"▪️ Cookies: {'✅' if data['cookies'] else '❌'} | "
+        f"Proxy: {'✅' if data['proxy'] else '❌'}",
     ]
     try:
         bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
