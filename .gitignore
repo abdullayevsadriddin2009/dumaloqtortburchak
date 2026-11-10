@@ -1,9 +1,11 @@
 # Lokal sozlamalar — bu fayl GitHub'ga yuborilmaydi
 .env
 bot_database.db
+bot.db
 __pycache__/
 *.pyc
 ffmpeg_bin/
+
 # Firebase xizmat kaliti — HECH QACHON GitHub'ga chiqmasin!
 firebase_key.json
 serviceAccountKey.json
