@@ -10,6 +10,7 @@ shart, aks holda istalgan odam tokenni olib botni boshqaradi.
 """
 
 import html
+import json
 import os
 import shutil
 import sqlite3
@@ -26,6 +27,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telebot import TeleBot, apihelper, types
 from telebot.apihelper import ApiTelegramException
+
+# Firebase (Firestore) — ma'lumotlar bulutda saqlanadi. Kutubxona yo'q bo'lsa
+# bot SQLite bilan ishlayveradi, shuning uchun import ixtiyoriy.
+try:
+    import firebase_admin
+    from firebase_admin import credentials as fb_credentials
+    from firebase_admin import firestore as fb_firestore
+
+    FIREBASE_LIB = True
+except Exception:  # pragma: no cover
+    FIREBASE_LIB = False
 
 # --- SOZLAMALAR (muhit o'zgaruvchilaridan) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -142,7 +154,83 @@ def ffmpeg_ready():
         return False
 
 
-# --- MA'LUMOTLAR BAZASI (SQLite) ---
+# --- MA'LUMOTLAR BAZASI: Firebase Firestore (+ SQLite zaxira) ---
+# Foydalanuvchilar, statistika va majburiy kanallar Firestore'da saqlanadi:
+# kod yangilansa, Render qayta qurilsa yoki bot boshqa joyda ishga tushsa
+# ham ma'lumotlar yo'qolmaydi. Firebase sozlanmagan bo'lsa, bot avtomatik
+# SQLite bilan ishlayveradi (hech qachon ishlamay qolmaydi).
+
+FIREBASE_KEY_FILES = (
+    os.environ.get("FIREBASE_KEY_FILE", ""),
+    "/etc/secrets/firebase_key.json",
+    "/etc/secrets/serviceAccountKey.json",
+    os.path.join(BASE_DIR, "firebase_key.json"),
+    os.path.join(BASE_DIR, "serviceAccountKey.json"),
+)
+
+CHANNELS_CACHE_TTL = 20  # soniya: har xabarda Firestore'ga murojaat qilmaslik uchun
+
+_fs_client = None
+_fs_ready = False
+_known_users = set()
+_channels_cache = []
+_channels_cache_at = 0.0
+_cache_lock = threading.Lock()
+
+
+def _firebase_certificate():
+    """Xizmat kalitini topadi: env (JSON matn yoki fayl yo'li) -> maxfiy fayl."""
+    for name in (
+        "FIREBASE_CREDENTIALS",
+        "FIREBASE_SERVICE_ACCOUNT",
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+    ):
+        value = (os.environ.get(name) or "").strip()
+        if not value:
+            continue
+        if value.startswith("{"):
+            return fb_credentials.Certificate(json.loads(value))
+        if os.path.isfile(value):
+            return fb_credentials.Certificate(value)
+    for path in FIREBASE_KEY_FILES:
+        if path and os.path.isfile(path):
+            return fb_credentials.Certificate(path)
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return fb_credentials.ApplicationDefault()
+    return None
+
+
+def init_firestore():
+    """Firestore'ga ulanadi. Muvaffaqiyatli bo'lsa True."""
+    global _fs_client, _fs_ready
+    if not FIREBASE_LIB:
+        print("[DB] firebase-admin topilmadi — SQLite ishlatiladi.")
+        return False
+    try:
+        certificate = _firebase_certificate()
+        if certificate is None:
+            print("[DB] Firebase kaliti topilmadi — SQLite ishlatiladi.")
+            return False
+        try:
+            firebase_admin.initialize_app(certificate)
+        except ValueError:
+            pass  # allaqachon ishga tushirilgan
+        _fs_client = fb_firestore.client()
+        _fs_client.collection("users").limit(1).get()  # ulanishni tekshirish
+        _fs_ready = True
+        print(f"[DB] Firestore ulandi (project: {_fs_client.project})")
+    except Exception as error:
+        _fs_client = None
+        _fs_ready = False
+        print(f"[DB] Firestore ulanmadi, SQLite ishlatiladi: {error}")
+    return _fs_ready
+
+
+def firestore_enabled():
+    return bool(_fs_ready and _fs_client is not None)
+
+
+# --- SQLite (zaxira / Firebase bo'lmasa) ---
 @contextmanager
 def db():
     conn = sqlite3.connect(DB_FILE, timeout=30)
@@ -188,9 +276,28 @@ def init_db():
 
 
 init_db()
+init_firestore()
 
 
+# --- FOYDALANUVCHILAR ---
 def add_user(user_id, username=None, first_name=None):
+    """Foydalanuvchini saqlaydi/yangilaydi (blokdan chiqaradi)."""
+    user_id = int(user_id)
+    if firestore_enabled():
+        try:
+            data = {
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "blocked": False,
+                "last_active": time.time(),
+            }
+            if user_id not in _known_users:
+                data["created_at"] = time.time()
+            _fs_client.collection("users").document(str(user_id)).set(data, merge=True)
+            _known_users.add(user_id)
+        except Exception as error:
+            print(f"[DB] add_user xatosi: {error}")
     with db() as conn:
         conn.execute(
             """
@@ -206,6 +313,17 @@ def add_user(user_id, username=None, first_name=None):
 
 
 def get_user_ids():
+    """Bloklamagan foydalanuvchilar ID'lari."""
+    if firestore_enabled():
+        try:
+            return [
+                int(doc.id)
+                for doc in _fs_client.collection("users")
+                .where("blocked", "==", False)
+                .stream()
+            ]
+        except Exception as error:
+            print(f"[DB] get_user_ids xatosi: {error}")
     with db() as conn:
         rows = conn.execute(
             "SELECT user_id FROM users WHERE COALESCE(blocked, 0) = 0"
@@ -214,16 +332,78 @@ def get_user_ids():
 
 
 def count_users():
+    if firestore_enabled():
+        try:
+            return int(_fs_client.collection("users").count().get()[0][0].value)
+        except Exception as error:
+            print(f"[DB] count_users xatosi: {error}")
     with db() as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
+def count_blocked():
+    if firestore_enabled():
+        try:
+            result = (
+                _fs_client.collection("users").where("blocked", "==", True).count().get()
+            )
+            return int(result[0][0].value)
+        except Exception as error:
+            print(f"[DB] count_blocked xatosi: {error}")
+    with db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM users WHERE COALESCE(blocked, 0) = 1"
+        ).fetchone()[0]
+
+
 def mark_user_blocked(user_id):
+    user_id = int(user_id)
+    _known_users.discard(user_id)
+    if firestore_enabled():
+        try:
+            _fs_client.collection("users").document(str(user_id)).set(
+                {"blocked": True}, merge=True
+            )
+        except Exception as error:
+            print(f"[DB] mark_user_blocked xatosi: {error}")
     with db() as conn:
         conn.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
 
 
+# --- MAJBURIY KANALLAR ---
+def _reset_channels_cache():
+    global _channels_cache, _channels_cache_at
+    with _cache_lock:
+        _channels_cache = []
+        _channels_cache_at = 0.0
+
+
 def get_channels():
+    """[(channel_id, channel_name, invite_link), ...]"""
+    global _channels_cache, _channels_cache_at
+    if firestore_enabled():
+        with _cache_lock:
+            fresh = (time.time() - _channels_cache_at) < CHANNELS_CACHE_TTL
+            if fresh:
+                return list(_channels_cache)
+        try:
+            rows = []
+            for doc in _fs_client.collection("channels").stream():
+                data = doc.to_dict() or {}
+                rows.append(
+                    (
+                        str(data.get("channel_id") or doc.id),
+                        data.get("channel_name"),
+                        data.get("invite_link"),
+                    )
+                )
+            rows.sort(key=lambda row: str(row[0]))
+            with _cache_lock:
+                _channels_cache = rows
+                _channels_cache_at = time.time()
+            return list(rows)
+        except Exception as error:
+            print(f"[DB] get_channels xatosi: {error}")
     with db() as conn:
         return conn.execute(
             "SELECT channel_id, channel_name, invite_link FROM channels"
@@ -231,14 +411,28 @@ def get_channels():
 
 
 def add_channel(channel_id, channel_name, invite_link):
+    channel_id = str(channel_id)
+    if firestore_enabled():
+        try:
+            _fs_client.collection("channels").document(channel_id).set(
+                {
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "invite_link": invite_link,
+                },
+                merge=True,
+            )
+        except Exception as error:
+            print(f"[DB] add_channel xatosi: {error}")
     with db() as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO channels (channel_id, channel_name, invite_link)
             VALUES (?, ?, ?)
             """,
-            (str(channel_id), channel_name, invite_link),
+            (channel_id, channel_name, invite_link),
         )
+    _reset_channels_cache()
 
 
 def remove_channel(identifier):
@@ -246,25 +440,51 @@ def remove_channel(identifier):
     identifier = (identifier or "").strip()
     if not identifier:
         return False
+    removed = False
+    if firestore_enabled():
+        try:
+            collection = _fs_client.collection("channels")
+            if collection.document(identifier).get().exists:
+                collection.document(identifier).delete()
+                removed = True
+            else:
+                for doc in collection.stream():
+                    data = doc.to_dict() or {}
+                    channel_id = str(data.get("channel_id") or doc.id)
+                    name = data.get("channel_name") or ""
+                    if (
+                        channel_id.lstrip("-") == identifier.lstrip("-")
+                        or name.lower() == identifier.lower()
+                        or doc.id.lstrip("-") == identifier.lstrip("-")
+                    ):
+                        collection.document(doc.id).delete()
+                        removed = True
+                        break
+        except Exception as error:
+            print(f"[DB] remove_channel xatosi: {error}")
     with db() as conn:
         cursor = conn.execute(
             "DELETE FROM channels WHERE channel_id = ?", (identifier,)
         )
         if cursor.rowcount:
-            return True
-        rows = conn.execute(
-            "SELECT channel_id, channel_name FROM channels"
-        ).fetchall()
-        for channel_id, name in rows:
-            if (
-                channel_id.lstrip("-") == identifier.lstrip("-")
-                or (name or "").lower() == identifier.lower()
-            ):
-                conn.execute(
-                    "DELETE FROM channels WHERE channel_id = ?", (channel_id,)
-                )
-                return True
-    return False
+            removed = True
+        else:
+            rows = conn.execute(
+                "SELECT channel_id, channel_name FROM channels"
+            ).fetchall()
+            for channel_id, name in rows:
+                if (
+                    str(channel_id).lstrip("-") == identifier.lstrip("-")
+                    or (name or "").lower() == identifier.lower()
+                ):
+                    conn.execute(
+                        "DELETE FROM channels WHERE channel_id = ?", (channel_id,)
+                    )
+                    removed = True
+                    break
+    if removed:
+        _reset_channels_cache()
+    return removed
 
 
 # --- MAJBURIY A'ZOLIK TEKSHIRUVI ---
@@ -852,7 +1072,7 @@ def handle_callback(call):
             pass
 
     elif data == "admin_stats":
-        blocked = count_users() - len(get_user_ids())
+        blocked = count_blocked()
         safe_edit(
             chat_id,
             call.message.message_id,
