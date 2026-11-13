@@ -24,6 +24,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -160,9 +161,85 @@ MAX_SEND_MB = _env_int("MAX_SEND_MB", 1900 if LOCAL_API else 49)
 # mos bo'lishi kerak, aks holda ulanish uzilib qoladi.
 SEND_TIMEOUT = _env_int("SEND_TIMEOUT", 3600 if LOCAL_API else 600)
 AUDIO_CALLBACK = "extract_audio"
+EFFECTS_CALLBACK = "afx_menu"
+EDITS_CALLBACK = "aex_menu"
+
+# --- AUDIO AMALLARI ---
+# "Audio Editor Pro" dasturidagi hamma amal bitta ro'yxatda:
+#   menu  : "fx" = ovoz effektlari, "ed" = tahrirlash
+#   filter: ffmpeg audio filtri (oddiy amallar uchun)
+#   args  : ffmpeg ga qo'shimcha argumentlar (masalan kanal soni)
+#   range : True bo'lsa foydalanuvchidan vaqt oralig'i so'raladi
+#   file  : True bo'lsa ikkinchi fayl so'raladi (birlashtirish)
+AUDIO_OPS = {
+    # ---- OVOZ EFFEKTLARI ----
+    "bass": {
+        "label": "🔊 Bass kuchaytirish",
+        "menu": "fx",
+        "filter": "bass=g=8:f=150,treble=g=2:f=3000",
+    },
+    "remix": {
+        "label": "🎵 Remiks",
+        "menu": "fx",
+        "filter": "bass=g=6:f=200,treble=g=4:f=2000,volume=3dB",
+    },
+    "speed": {"label": "⚡ Tezlashtirish 1.25x", "menu": "fx", "filter": "atempo=1.25"},
+    "slow": {"label": "🐢 Sekinlashtirish 0.8x", "menu": "fx", "filter": "atempo=0.8"},
+    "pitch": {
+        "label": "🎚 Balandlik +2",
+        "menu": "fx",
+        "filter": "aresample=44100,asetrate=44100*1.122,aresample=44100,atempo=0.891",
+    },
+    "voice": {
+        "label": "🎙 Ovoz rejimi",
+        "menu": "fx",
+        "filter": "highpass=f=300,lowpass=f=3400,volume=6dB",
+        "args": ["-ac", "1"],
+    },
+    "8d": {
+        "label": "🌀 8D audio",
+        "menu": "fx",
+        "filter": "aecho=0.8:0.9:1000:0.3,apulsator=hz=0.1667:amount=0.9",
+        "args": ["-ac", "2"],
+    },
+    "echo": {
+        "label": "📢 Aks sado",
+        "menu": "fx",
+        "filter": "aecho=0.8:0.7:300|600|900:0.5|0.35|0.25",
+    },
+    "fade": {
+        "label": "🔉 Fade in/out",
+        "menu": "fx",
+        "filter": "afade=t=in:st=0:d=3,areverse,afade=t=in:st=0:d=3,areverse",
+    },
+    "reverse": {"label": "🔁 Teskari", "menu": "fx", "filter": "areverse"},
+    "normalize": {
+        "label": "📏 Normalizatsiya",
+        "menu": "fx",
+        "filter": "loudnorm=I=-16:TP=-1.5:LRA=11",
+    },
+    "eq": {
+        "label": "🎼 EQ boost",
+        "menu": "fx",
+        "filter": "equalizer=f=60:t=q:w=1:g=4,equalizer=f=250:t=q:w=1:g=2,"
+        "equalizer=f=4000:t=q:w=1:g=3,equalizer=f=12000:t=q:w=1:g=2",
+    },
+    # ---- TAHRIRLASH ----
+    "cut": {"label": "✂️ Oraliqni kesish", "menu": "ed", "range": True},
+    "copy": {"label": "📋 Oraliqni nusxalash", "menu": "ed", "range": True},
+    "mute": {"label": "🗑 Oraliqni o'chirish", "menu": "ed", "range": True},
+    "merge": {"label": "🔗 Birlashtirish", "menu": "ed", "file": True},
+    "stereo": {"label": "🎛 Stereo", "menu": "ed", "args": ["-ac", "2"]},
+    "mono": {"label": "🎛 Mono", "menu": "ed", "args": ["-ac", "1"]},
+}
+
+# Menyu prefikslari (callback_data): fx -> afx:<amal>, ed -> aex:<amal>
+MENU_PREFIX = {"fx": "afx", "ed": "aex"}
+MENU_BACK = "audio_back"
+
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.20"
+BUILD_VERSION = "2026-11-10.23"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -674,12 +751,37 @@ def build_caption(extra=""):
 
 
 def audio_keyboard():
-    """Video ostidagi \"Ovozni ajratib olish\" tugmasi."""
+    """Video/audio ostidagi uchta tugma: ajratish, effektlar, tahrirlash."""
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
         types.InlineKeyboardButton(
-            text="🎧 Ovozni ajratib olish", callback_data=AUDIO_CALLBACK
-        )
+            text="🎧 Ovozni ajratish", callback_data=AUDIO_CALLBACK
+        ),
+        types.InlineKeyboardButton(
+            text="🎛 Effektlar", callback_data=EFFECTS_CALLBACK
+        ),
+        types.InlineKeyboardButton(
+            text="✂️ Tahrirlash", callback_data=EDITS_CALLBACK
+        ),
+    )
+    return keyboard
+
+
+def menu_keyboard(menu):
+    """Bitta menyu (fx yoki ed) uchun tugmalar: 3 tadan qator."""
+    prefix = MENU_PREFIX[menu]
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    keyboard.add(
+        *[
+            types.InlineKeyboardButton(
+                text=conf["label"], callback_data=f"{prefix}:{key}"
+            )
+            for key, conf in AUDIO_OPS.items()
+            if conf["menu"] == menu
+        ]
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(text="⬅️ Orqaga", callback_data=MENU_BACK)
     )
     return keyboard
 
@@ -1153,13 +1255,18 @@ INSTRUCTIONS = (
     "<b>1️⃣ Video o'girish</b>\n"
     "▫️ Oddiy <b>to'rtburchak video</b> yuboring ➡️ uni <b>dumaloq video</b> qilaman.\n"
     "▫️ <b>Dumaloq video</b> yuboring ➡️ to'liq kadrli <b>to'rtburchak video</b> qilaman.\n\n"
-    "<b>2️⃣ Ovozni ajratib olish</b>\n"
-    "Tayyor video ostidagi <b>🎧 Ovozni ajratib olish</b> tugmasini bosing ➡️ "
-    "videoning ovozi alohida (mp3) yuboriladi.\n\n"
+    "<b>2️⃣ Ovoz</b>\n"
+    "Tayyor video ostidagi tugmalar:\n"
+    "▫️ <b>🎧 Ovozni ajratish</b> ➡️ mp3\n"
+    "▫️ <b>🎛 Effektlar</b> ➡️ bass, remiks, tezlik, pitch, 8D, aks sado, "
+    "fade, teskari, normalizatsiya, EQ\n"
+    "▫️ <b>✂️ Tahrirlash</b> ➡️ kesish, nusxalash, o'chirish, birlashtirish, "
+    "stereo/mono\n\n"
     "<b>3️⃣ Havoladan yuklash</b>\n"
-    "Instagram, YouTube, TikTok va boshqa saytlardagi video havolasini yuboring "
-    "➡️ videoni yuklab beraman.\n\n"
-    "⚡️ Shunchaki videoni yoki havolani yuboring — qolganini men bajaraman!"
+    "Instagram, TikTok, Facebook havolasini yuboring ➡️ videoni yuklab beraman.\n"
+    "(YouTube serverdan yuklanmaydi — videoni to'g'ridan-to'g'ri yuboring.)\n\n"
+    "⚡️ Shunchaki videoni yoki havolani yuboring — qolganini men bajaraman!\n\n"
+    "📋 Barcha buyruqlar: /help"
 )
 
 
@@ -1311,6 +1418,12 @@ def handle_group_media(message):
 
 def start_conversion(message, kind):
     user = message.from_user
+
+    # Birlashtirish kutilyotgan bo'lsa, video konvertatsiya qilinmaydi —
+    # uning ovozi birinchi faylga qo'shiladi.
+    pending_merge = take_pending(user.id, op="merge")
+    if pending_merge is not None and start_merge_with(message, pending_merge):
+        return
 
     # Admin panel amali uchun yuborilgan xabar (masalan, reklama posti) hech
     # qachon konvertatsiyaga tushmasligi kerak.
@@ -1598,7 +1711,364 @@ def handle_extract_audio(call):
     executor.submit(audio_job, call.message.chat.id, user_id, video)
 
 
-# --- HAVOLADAN VIDEO YUKLASH (Instagram, YouTube, TikTok...) ---
+# --- AUDIO AMALLARI (ffmpeg) ---
+# Qaysi xabardagi media tanlanganini eslab qolamiz — callback'da file_id
+# qayta so'ralmaydi.
+effect_sources = {}
+# Vaqt oralig'i yoki ikkinchi fayl kutayotgan amallar: user_id -> dict
+audio_pending = {}
+PENDING_TTL = 900
+RANGE_HINT = (
+    "⏱ Vaqt oralig'ini yozing — boshlanish va tugash:\n"
+    "`0:10-0:25`  yoki  `10-25`\n\n"
+    "Bekor qilish: `bekor`"
+)
+
+
+def _clock_seconds(value):
+    """'1:05' yoki '75' yoki '0:10.5' -> sekund."""
+    parts = str(value).split(":")
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError:
+        return None
+    seconds = 0.0
+    for number in numbers:
+        seconds = seconds * 60 + number
+    return seconds
+
+
+def parse_time_range(text):
+    """'0:10-0:25' -> (10.0, 25.0); noto'g'ri bo'lsa None."""
+    match = re.match(r"^\s*(\d+(?::\d+)*(?:\.\d+)?)\s*[-–—]\s*(\d+(?::\d+)*(?:\.\d+)?)\s*$", text or "")
+    if not match:
+        return None
+    start = _clock_seconds(match.group(1))
+    end = _clock_seconds(match.group(2))
+    if start is None or end is None or end <= start:
+        return None
+    return round(start, 2), round(end, 2)
+
+
+def range_graph(op, start, end):
+    """Kesish / nusxalash / o'chirish uchun ffmpeg filter grafigi."""
+    if op == "mute":
+        return f"[0:a]volume=0:enable='between(t,{start},{end})'[a]"
+    if op == "copy":
+        return (
+            f"[0:a]atrim=end={end},asetpts=N/SR/TB[a1];"
+            f"[0:a]atrim=start={start}:end={end},asetpts=N/SR/TB[a2];"
+            f"[0:a]atrim=start={end},asetpts=N/SR/TB[a3];"
+            "[a1][a2][a3]concat=n=3:v=0:a=1[a]"
+        )
+    # cut: oraliq butunlay olib tashlanadi
+    if start <= 0.05:
+        return f"[0:a]atrim=start={end},asetpts=N/SR/TB[a]"
+    return (
+        f"[0:a]atrim=end={start},asetpts=N/SR/TB[a1];"
+        f"[0:a]atrim=start={end},asetpts=N/SR/TB[a2];"
+        "[a1][a2]concat=n=2:v=0:a=1[a]"
+    )
+
+
+def run_audio_op(input_path, output_path, op, arg=None, second_path=None):
+    """Bitta audio amalini bajaradi va mp3 chiqaradi."""
+    conf = AUDIO_OPS[op]
+    command = [
+        FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+    ]
+
+    if conf.get("file"):
+        if not second_path:
+            raise RuntimeError("ikkinchi fayl kerak")
+        command += ["-i", second_path]
+        graph = (
+            "[0:a]aresample=44100,"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo[a0];"
+            "[1:a]aresample=44100,"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo[a1];"
+            "[a0][a1]concat=n=2:v=0:a=1[a]"
+        )
+        command += ["-filter_complex", graph, "-map", "[a]"]
+    elif conf.get("range"):
+        if not arg:
+            raise RuntimeError("vaqt oralig'i kerak")
+        command += [
+            "-filter_complex", range_graph(op, arg[0], arg[1]), "-map", "[a]"
+        ]
+    else:
+        command += ["-vn", "-map", "0:a:0?"]
+        if conf.get("filter"):
+            command += ["-af", conf["filter"]]
+
+    command += [*conf.get("args", []), "-c:a", "libmp3lame", "-q:a", "2", output_path]
+
+    try:
+        run_ffmpeg(command)
+    except RuntimeError as error:
+        if "does not contain any stream" in str(error):
+            raise RuntimeError("bu faylda ovoz (audio) yo'q") from error
+        raise
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1024:
+        raise RuntimeError("bu faylda ovoz (audio) yo'q")
+
+
+def op_title(op):
+    """Audio nomi uchun emojisiz matn."""
+    label = AUDIO_OPS[op]["label"]
+    return re.sub(r"[^\w\s&+.-]", "", label).strip() or "Audio"
+
+
+def audio_op_job(chat_id, user_id, media, op, arg=None, second_media=None, reply_to=None):
+    label = AUDIO_OPS[op]["label"]
+    workdir = tempfile.mkdtemp(prefix="aop_")
+    input_path = os.path.join(workdir, "input")
+    output_path = os.path.join(workdir, "out.mp3")
+    try:
+        download_media(media.file_id, input_path)
+        second_path = None
+        if second_media is not None:
+            second_path = os.path.join(workdir, "second")
+            download_media(second_media.file_id, second_path)
+
+        run_audio_op(input_path, output_path, op, arg, second_path)
+
+        with open(output_path, "rb") as audio_file:
+            with_retry(
+                lambda: bot.send_audio(
+                    chat_id,
+                    audio_file,
+                    caption=build_caption(f"{label} tayyor!"),
+                    title=op_title(op),
+                    reply_markup=audio_keyboard(),
+                    reply_to_message_id=reply_to,
+                    timeout=SEND_TIMEOUT,
+                )
+            )
+    except ApiTelegramException as error:
+        traceback.print_exc()
+        text = "❌ Amalni bajarib bo'lmadi. Iltimos, qayta urinib ko'ring."
+        if error.error_code == 400 and "too big" in str(error).lower():
+            text = "❌ Natija Telegram chegarasidan katta — qisqaroq fayl bilan urinib ko'ring."
+        bot.send_message(chat_id, text)
+    except Exception as error:
+        traceback.print_exc()
+        text = "❌ Amalni bajarib bo'lmadi. Iltimos, qayta urinib ko'ring."
+        if isinstance(error, RuntimeError) and "ovoz" in str(error):
+            text = "❌ Bu faylda ovoz (audio) yo'q — amalni bajarib bo'lmaydi."
+        elif isinstance(error, RuntimeError) and "uzoq" in str(error):
+            text = "❌ Fayl juda uzun, ishlov berish to'xtatildi."
+        if user_id in ADMIN_IDS:
+            reason = str(error)[:280].replace("<", "&lt;").replace(">", "&gt;")
+            text += f"\n\n<i>Sabab: {reason}</i>"
+        bot.send_message(chat_id, text, parse_mode="HTML")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        release_user(user_id)
+
+
+def media_from_message(message):
+    """Xabardagi video / audio / hujjatni qaytaradi."""
+    for attr in ("video", "audio", "document", "video_note"):
+        media = getattr(message, attr, None)
+        if media is not None:
+            return media
+    return None
+
+
+def remember_pending(user_id, op, media, chat_id, message_id):
+    audio_pending[user_id] = {
+        "op": op,
+        "media": media,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "at": time.time(),
+    }
+
+
+def take_pending(user_id, op=None):
+    """Kutilayotgan amalni oladi (muddati o'tgan bo'lsa tashlab yuboradi)."""
+    item = audio_pending.get(user_id)
+    if not item:
+        return None
+    if time.time() - item["at"] > PENDING_TTL:
+        audio_pending.pop(user_id, None)
+        return None
+    if op is not None and item["op"] != op:
+        return None
+    return item
+
+
+def open_audio_menu(call, menu):
+    """Effektlar yoki tahrirlash menyusini ochadi."""
+    media = media_from_message(call.message)
+    if media is None:
+        safe_answer(
+            call,
+            "❌ Bu menyuni faqat video/audio ostidagi tugma orqali ochish mumkin.",
+            show_alert=True,
+        )
+        return
+    if len(effect_sources) > 1000:
+        effect_sources.clear()
+    effect_sources[(call.message.chat.id, call.message.message_id)] = media
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=menu_keyboard(menu),
+        )
+    except Exception:
+        bot.send_message(
+            call.message.chat.id,
+            "Amalni tanlang:",
+            reply_markup=menu_keyboard(menu),
+            reply_to_message_id=call.message.message_id,
+        )
+    safe_answer(call, "Amalni tanlang")
+
+
+def handle_audio_op(call, op):
+    """Tanlangan amalni boshlaydi: darhol, vaqt oralig'i yoki 2-fayl bilan."""
+    if op not in AUDIO_OPS:
+        safe_answer(call)
+        return
+    chat_id = call.message.chat.id
+    media = effect_sources.get((chat_id, call.message.message_id)) or media_from_message(
+        call.message
+    )
+    if media is None:
+        safe_answer(call, "❌ Fayl topilmadi — amalni qaytadan tanlang.", show_alert=True)
+        return
+    size = getattr(media, "file_size", 0) or 0
+    if size > MAX_INPUT_MB * 1024 * 1024:
+        safe_answer(
+            call,
+            f"❌ Fayl {MAX_INPUT_MB} MB dan katta — Telegram bot uni yuklab ololmaydi.",
+            show_alert=True,
+        )
+        return
+
+    conf = AUDIO_OPS[op]
+    user_id = call.from_user.id
+
+    if conf.get("range"):
+        remember_pending(user_id, op, media, chat_id, call.message.message_id)
+        safe_answer(call, "Vaqt oralig'ini yozing")
+        bot.send_message(
+            chat_id,
+            f"{conf['label']}\n\n{RANGE_HINT}",
+            reply_to_message_id=call.message.message_id,
+            parse_mode="Markdown",
+        )
+        return
+
+    if conf.get("file"):
+        remember_pending(user_id, op, media, chat_id, call.message.message_id)
+        safe_answer(call, "Ikkinchi faylni yuboring")
+        bot.send_message(
+            chat_id,
+            "🔗 Ikkinchi audio yoki videoni yuboring — u birinchisining "
+            "oxiriga qo'shiladi.",
+            reply_to_message_id=call.message.message_id,
+        )
+        return
+
+    if not acquire_user(user_id):
+        safe_answer(call, "⏳ Oldingi amalingiz tugamadi. Iltimos, kuting.", show_alert=True)
+        return
+    safe_answer(call, f"{conf['label']} qo'llanmoqda...")
+    executor.submit(
+        audio_op_job,
+        chat_id,
+        user_id,
+        media,
+        op,
+        None,
+        None,
+        call.message.message_id,
+    )
+
+
+def start_merge_with(message, item):
+    """Birlashtirish uchun ikkinchi fayl keldi."""
+    second = media_from_message(message)
+    if second is None:
+        return False
+    user_id = message.from_user.id
+    if not acquire_user(user_id):
+        bot.reply_to(message, "⏳ Oldingi amalingiz tugamadi. Iltimos, kuting.")
+        return True
+    audio_pending.pop(user_id, None)
+    bot.reply_to(message, "🔗 Fayllar birlashtirilmoqda...")
+    executor.submit(
+        audio_op_job,
+        message.chat.id,
+        user_id,
+        item["media"],
+        "merge",
+        None,
+        second,
+        item["message_id"],
+    )
+    return True
+
+
+@bot.message_handler(
+    content_types=["text"],
+    chat_types=["private"],
+    func=lambda m: take_pending(m.from_user.id) is not None,
+)
+def handle_audio_edit_range(message):
+    """Kesish/nusxalash/o'chirish uchun vaqt oralig'ini qabul qiladi."""
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+    item = take_pending(user_id)
+    if item is None:
+        return
+
+    if text.lower() in ("bekor", "cancel", "/cancel"):
+        audio_pending.pop(user_id, None)
+        bot.reply_to(message, "❌ Bekor qilindi.")
+        return
+
+    span = parse_time_range(text)
+    if span is None:
+        bot.reply_to(
+            message,
+            "❌ Vaqt oralig'i noto'g'ri. Masalan: `0:10-0:25` yoki `10-25`.\n"
+            "Bekor qilish: `bekor`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not acquire_user(user_id):
+        bot.reply_to(message, "⏳ Oldingi amalingiz tugamadi. Iltimos, kuting.")
+        return
+    audio_pending.pop(user_id, None)
+    bot.reply_to(message, f"⏳ {AUDIO_OPS[item['op']]['label']} bajarilmoqda...")
+    executor.submit(
+        audio_op_job,
+        message.chat.id,
+        user_id,
+        item["media"],
+        item["op"],
+        span,
+        None,
+        item["message_id"],
+    )
+
+
+@bot.message_handler(content_types=["audio", "document"], chat_types=["private"])
+def handle_audio_document(message):
+    """Birlashtirish kutilyotgan bo'lsa, ikkinchi faylni qabul qiladi."""
+    item = take_pending(message.from_user.id, op="merge")
+    if item is not None:
+        start_merge_with(message, item)
+
+
+# --- HAVOLADAN VIDEO YUKLASH (Instagram, TikTok, Facebook...) ---
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
@@ -1733,13 +2203,14 @@ _proxy_searching = threading.Event()
 
 
 def free_proxy_enabled():
-    """YT_FREE_PROXY=0 bilan o'chirish mumkin. Qo'lda proxy bo'lsa — kerak emas."""
+    """Bepul proxy qidiruvi sukut bo'yicha O'CHIQ.
+
+    Sabab: 500 dan ortiq bepul proxy sinalgan, birortasi YouTube'ni ochmadi —
+    faqat CPU va vaqt sarflaydi. Kerak bo'lsa YT_FREE_PROXY=1 bilan yoqiladi;
+    ishonchli yo'l — qo'lda YT_PROXY.
+    """
     raw = (_env("YT_FREE_PROXY") or "").strip().lower()
-    if raw in ("0", "false", "no", "off"):
-        return False
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    return not yt_proxy()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _fetch_free_proxies():
@@ -1966,6 +2437,26 @@ def ensure_mp4(input_path, workdir):
     return output_path
 
 
+YOUTUBE_BLOCKED_TEXT = (
+    "❌ <b>YouTube videolarini serverdan yuklab bo'lmaydi.</b>\n\n"
+    "YouTube ma'lumot markazi IP'larini bloklaydi, shuning uchun bu yo'l "
+    "ishlamaydi.\n\n"
+    "✅ Videoni <b>to'g'ridan-to'g'ri yuboring</b> — dumaloq qilish, ovoz "
+    "ajratish va effektlar to'liq ishlaydi.\n"
+    "✅ Instagram, TikTok, Facebook havolalari ishlaydi."
+)
+
+
+def youtube_disabled():
+    """YouTube yuklash sukut bo'yicha o'chirilgan (ishlamaydi).
+
+    Qo'lda YT_PROXY berilgan bo'lsa yoki YT_ENABLE=1 bo'lsa — urinib ko'riladi.
+    """
+    if yt_proxy():
+        return False
+    return (_env("YT_ENABLE") or "").strip().lower() not in ("1", "true", "yes", "on")
+
+
 def start_link_download(message, url):
     user = message.from_user
     add_user(user.id, user.username, user.first_name)
@@ -1988,6 +2479,11 @@ def start_link_download(message, url):
         bot.reply_to(
             message, "❌ Serverda FFmpeg topilmadi. Admin bilan bog'laning."
         )
+        return
+
+    # YouTube bloklangan — behuda urinish, proxy qidirish va vaqt sarflash yo'q.
+    if is_youtube_url(url) and youtube_disabled():
+        bot.reply_to(message, YOUTUBE_BLOCKED_TEXT, parse_mode="HTML")
         return
 
     if not acquire_user(user.id):
@@ -2154,6 +2650,30 @@ def handle_callback(call):
 
     if data == AUDIO_CALLBACK:
         handle_extract_audio(call)
+        return
+
+    if data == EFFECTS_CALLBACK:
+        open_audio_menu(call, "fx")
+        return
+
+    if data == EDITS_CALLBACK:
+        open_audio_menu(call, "ed")
+        return
+
+    if data == MENU_BACK:
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=audio_keyboard(),
+            )
+        except Exception:
+            pass
+        safe_answer(call)
+        return
+
+    if data.startswith(("afx:", "aex:")):
+        handle_audio_op(call, data.split(":", 1)[1])
         return
 
     if not is_admin(user_id):
@@ -2590,6 +3110,70 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def run_health_server():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
     server.serve_forever()
+
+
+HELP_TEXT = (
+    "🤖 <b>Bot imkoniyatlari</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "🎬 <b>Video</b>\n"
+    "• To'rtburchak video → dumaloq video (638px, 12 MB ichida siqiladi)\n"
+    "• Dumaloq video → to'liq kadrli to'rtburchak video\n"
+    "• Havola: Instagram / TikTok / Facebook\n\n"
+    "🎵 <b>Ovoz</b>\n"
+    "• 🎧 Ovozni ajratish — mp3\n"
+    "• 🎛 Effektlar — bass, remiks, tezlashtirish, sekinlashtirish, pitch, "
+    "ovoz rejimi, 8D, aks sado, fade, teskari, normalizatsiya, EQ\n"
+    "• ✂️ Tahrirlash — oraliqni kesish, nusxalash, o'chirish, birlashtirish, "
+    "stereo, mono\n\n"
+    "ℹ️ <b>Buyruqlar</b>\n"
+    "• /start — boshlash\n"
+    "• /help — shu ro'yxat\n"
+    "• /id — Telegram ID\n"
+    "• /ping — javob tezligi\n"
+    "• /date — mahalliy vaqt\n"
+    "• /status — texnik holat (admin)"
+)
+
+
+@bot.message_handler(commands=["help"], chat_types=["private"])
+def help_handler(message):
+    bot.reply_to(message, HELP_TEXT, parse_mode="HTML", disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=["ping"])
+def ping_handler(message):
+    started = time.time()
+    bot_ok = True
+    try:
+        bot.get_me()
+    except Exception:
+        bot_ok = False
+    latency = int((time.time() - started) * 1000)
+    uptime = int(time.time() - STARTED_AT)
+    hours, rest = divmod(uptime, 3600)
+    minutes, seconds = divmod(rest, 60)
+    bot.reply_to(
+        message,
+        "🏓 <b>Pong!</b>\n"
+        f"⚡ Javob: <b>{latency} ms</b>{'' if bot_ok else ' (API bilan aloqa sekin)'}\n"
+        f"⏱ Ishlash vaqti: <b>{hours} soat {minutes} daq {seconds} son</b>",
+        parse_mode="HTML",
+    )
+
+
+@bot.message_handler(commands=["date"])
+def date_handler(message):
+    # O'zbekiston vaqti (UTC+5, yozgi vaqtga o'tilmaydi).
+    moment = datetime.now(timezone(timedelta(hours=5)))
+    weekdays = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba",
+                "Juma", "Shanba", "Yakshanba"]
+    bot.reply_to(
+        message,
+        "🕐 <b>Mahalliy vaqt</b>\n"
+        f"📅 {moment.strftime('%d.%m.%Y')} — {weekdays[moment.weekday()]}\n"
+        f"⏰ {moment.strftime('%H:%M:%S')} (UTC+5)",
+        parse_mode="HTML",
+    )
 
 
 @bot.message_handler(commands=["status"], chat_types=["private"])
