@@ -239,7 +239,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.23"
+BUILD_VERSION = "2026-11-10.30"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -250,6 +250,7 @@ STATE = {
     "conflicts_409": 0,
     "poll_restarts": 0,
     "last_poll_note": "",
+    "poll_fail_streak": 0,
 }
 
 PORT = _env_int("PORT", 8080)
@@ -1045,6 +1046,53 @@ def remux_video(input_path, output_path):
     ])
 
 
+# Kvadratga sig'maydigan videolar uchun chegara: shu oraliqda bo'lsa
+# markazdan kesiladi (kadr deyarli to'rtburchak edi), aks holda butun kadr
+# o'rtaga qo'yiladi (atrofi xira fon bilan) — hech narsa kesilmaydi.
+SQUARE_COVER_MIN = 0.8
+SQUARE_COVER_MAX = 1.25
+# auto | cover | fit  (muhit o'zgaruvchisi bilan majburlash mumkin)
+SQUARE_MODE = (_env("SQUARE_MODE") or "auto").strip().lower()
+
+
+def square_mode(width, height):
+    """Qaysi usul: 'cover' (markazdan kesish) yoki 'fit' (butun kadr)."""
+    if SQUARE_MODE in ("cover", "fit"):
+        return SQUARE_MODE
+    if not width or not height:
+        return "cover"
+    aspect = width / float(height)
+    if SQUARE_COVER_MIN <= aspect <= SQUARE_COVER_MAX:
+        return "cover"
+    return "fit"
+
+
+def square_filter(size, mode, trim=""):
+    """Kvadrat uchun ffmpeg filter grafigi (chiqish: [v])."""
+    head = (
+        "[0:v]" + trim +
+        # SAR normallashtirish: 16:15, 2:1 kabi nisbatlar cho'zilib ketmasin.
+        "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1,"
+    )
+    if mode == "cover":
+        return (
+            head +
+            "crop='trunc(min(iw,ih)/2)*2':'trunc(min(iw,ih)/2)*2',"
+            f"scale={size}:{size}:flags=lanczos,setsar=1,format=yuv420p[v]"
+        )
+    # fit: butun kadr o'rtada, atrofi shu videoning xiralashtirilgan nusxasi.
+    # Na cho'ziladi, na kesiladi — dumaloqning chetlari ham bo'sh qolmaydi.
+    return (
+        head +
+        "split=2[bg][fg];"
+        f"[bg]scale={size}:{size}:force_original_aspect_ratio=increase,"
+        f"crop={size}:{size},gblur=sigma=24,eq=brightness=-0.10[bgb];"
+        f"[fg]scale={size}:{size}:force_original_aspect_ratio=decrease:"
+        "flags=lanczos[fgs];"
+        "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[v]"
+    )
+
+
 def make_square_video(input_path, output_path):
     """To'rtburchak videoni dumaloq (video note) uchun kvadratga keltiradi.
 
@@ -1088,34 +1136,25 @@ def make_square_video(input_path, output_path):
                     f"[SQUARE] hoshiya kesiladi: {frame_w}x{frame_h} -> "
                     f"{box_w}x{box_h}"
                 )
-    filter_complex = (
-        "[0:v]" + trim +
-        # 1) SAR (piksel nisbati) 1:1 ga keltiriladi. Ba'zi videolar 16:15,
-        #    2:1 kabi nisbat bilan keladi — ular normallashtirilmasa natija
-        #    cho'zilgan/toraytirilgan ("2 xil") ko'rinishda chiqadi.
-        "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1,"
-        # 2) Markazdan kvadrat qirqish — kadr dumaloqni to'liq to'ldiradi,
-        #    qora hoshiya yoki kichraytirilgan kadr bo'lmaydi. O'lcham juft
-        #    qilinadi (toq piksel ba'zi o'lchamlarda xato beradi).
-        "crop='trunc(min(iw,ih)/2)*2':'trunc(min(iw,ih)/2)*2',"
-        f"scale={SQUARE_SIZE}:{SQUARE_SIZE}:flags=lanczos,"  # video note chegarasi
-        "setsar=1,format=yuv420p[v]"
-    )
+    # Kadr hoshiyasi kesilgandan keyingi haqiqiy o'lcham.
+    if trim and box:
+        eff_w, eff_h = box[0], box[1]
+    elif info:
+        eff_w, eff_h = info[0], info[1]
+    else:
+        eff_w = eff_h = 0
+    mode = square_mode(eff_w, eff_h)
+    if mode == "fit":
+        print(f"[SQUARE] butun kadr saqlanadi ({eff_w}x{eff_h}, xira fon bilan)")
     duration = info[2] if info else 0
 
     def build(rate_args, size):
-        square_filter = filter_complex
-        if size != SQUARE_SIZE:
-            square_filter = filter_complex.replace(
-                f"scale={SQUARE_SIZE}:{SQUARE_SIZE}:flags=lanczos,",
-                f"scale={size}:{size}:flags=lanczos,",
-            )
         return [
             FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
             "-i", input_path,
             "-t", "59",                                  # video note chegarasi
             "-map", "[v]", "-map", "0:a:0?",             # audio bo'lmasa ham ishlaydi
-            "-filter_complex", square_filter,
+            "-filter_complex", square_filter(size, mode, trim),
             # veryfast + crf 17: o'lchovda "fast/crf18" dan ~3.5x tez,
             # sifat deyarli bir xil (SSIM 0.9975 / 0.9980)
             "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-threads", "2",
@@ -1168,26 +1207,121 @@ def make_square_video(input_path, output_path):
     raise RuntimeError("dumaloq video 12 MB chegarasiga sig'madi")
 
 
-def make_rectangle_video(input_path, output_path):
-    """Dumaloq videoni oddiy videoga aylantiradi — manba nisbatini saqlab.
+# --- DUMALOQ -> TO'RTBURCHAK (yangi) ---
+# Dumaloq video ikki xil fayl bo'lishi mumkin:
+#   1) oddiy kvadrat video — kadr to'liq, niqob faylda yo'q;
+#   2) "oq/kulrang fon + doira" qilib saqlangan fayl — fon kesilishi kerak.
+# Kamera yozuvlarida fon bir xil bo'lmaydi (gradient, shovqin), shuning uchun
+# rang median bo'yicha va keng tolerans bilan tekshiriladi.
+MASK_FRAME_WIDTH = 160          # tahlil kadri kengligi (tez)
+MASK_BORDER_RATIO = 0.05        # fon rangi olinadigan tashqi hoshiya
+MASK_BG_TOLERANCE = 46          # fondan shu masofadan uzoq piksel = kontent
+MASK_MIN_BG_SHARE = 0.10        # fon kamida 10% (aks holda niqob emas)
+MASK_MAX_BG_SHARE = 0.42        # fon ko'pi bilan 42%
+MASK_SIDE_FACTOR = 0.7071 * 0.97  # doiraga ichki kvadrat + zaxira
+RECT_CROP_FACTOR = 0.7071 * 0.91  # dumaloq video uchun kesish ulushi
+# 0.7071 = doiraga ichki chizilgan kvadrat; 0.91 zaxira — faylda doira
+# atrofida kichik hoshiya (oq/xira fon) bo'lsa ham qolib ketmasligi uchun.
 
-    16:9 ga majburlash yo'q: kadr kesilmaydi va yon tomonlarga bo'sh joy
-    qo'shilmaydi. Kvadrat (dumaloq) video kvadrat holda, to'liq kadr bilan
-    chiqadi; shu sababli Telegram uni dumaloq qilib ko'rsatmaydi.
+
+def _median_color(pixels):
+    if not pixels:
+        return (0, 0, 0)
+    return tuple(sorted(p[k] for p in pixels)[len(pixels) // 2] for k in range(3))
+
+
+def _is_background(color, base, tolerance=MASK_BG_TOLERANCE):
+    return max(abs(color[k] - base[k]) for k in range(3)) <= tolerance
+
+
+def mask_crop_box(input_path, info):
+    """Fayl ichida chizilgan doira niqobini topadi.
+
+    Qaytaradi: (tomon, x, y) — kadrga nisbatan ulushlar (0..1), yoki None.
+    Kesish kvadrati doira markazida va diametrning 1/√2 qismiga teng —
+    ya'ni burchaklarda fon (oq) qolmaydi.
     """
-    info = probe_video(input_path)
-    # Dumaloq videoni to'rtburchakka chiqarishda odatda hech qanday o'zgartirish
-    # kerak emas: fayl asl sifatida qoladi va darhol yuboriladi.
-    if info and max(info[0], info[1]) <= 1920 and can_remux(input_path, max_width=1920):
-        print("[RECT] qayta kodlanmaydi (tez nusxa)")
-        remux_video(input_path, output_path)
-        return
+    if not info:
+        return None
+    width, height = info[0], info[1]
+    if not width or not height or abs(width - height) > max(6, width * 0.08):
+        return None  # kvadrat fayl emas
 
-    video_filter = (
-        "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
-        "setsar=1,format=yuv420p"
-    )
-    command = [
+    frame = _frame_pixels(input_path, MASK_FRAME_WIDTH)
+    if not frame:
+        return None
+    data, fw, fh = frame
+
+    def pixel(x, y):
+        index = (y * fw + x) * 3
+        return data[index], data[index + 1], data[index + 2]
+
+    # 1) Fon rangi: tashqi hoshiyaning medianasi (gradientga chidamli).
+    ring = max(2, int(min(fw, fh) * MASK_BORDER_RATIO))
+    border = [
+        pixel(x, y)
+        for y in range(fh)
+        for x in range(fw)
+        if x < ring or y < ring or x >= fw - ring or y >= fh - ring
+    ]
+    base = _median_color(border)
+
+    # 2) Kontent chegarasi va fon ulushi.
+    min_x, max_x, min_y, max_y = fw, -1, fh, -1
+    background = 0
+    for y in range(fh):
+        for x in range(fw):
+            if _is_background(pixel(x, y), base):
+                background += 1
+                continue
+            if x < min_x:
+                min_x = x
+            if x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            if y > max_y:
+                max_y = y
+    if max_x < 0 or max_y < 0:
+        return None  # butun kadr bir rang
+
+    background_share = background / float(fw * fh)
+    if not MASK_MIN_BG_SHARE <= background_share <= MASK_MAX_BG_SHARE:
+        return None  # fon juda kam/ko'p — bu niqob emas
+
+    box_w = max_x - min_x + 1
+    box_h = max_y - min_y + 1
+    if min(box_w, box_h) < fw * 0.5:
+        return None  # kontent juda kichik
+    if abs(box_w - box_h) > 0.18 * max(box_w, box_h):
+        return None  # kontent kvadrat emas — doira niqobi emas
+
+    # 3) Doira ekanini tasdiqlash: kontent chegarasining burchaklari fon bo'lishi
+    #    shart (to'rtburchak kontentda ular kontent bo'ladi).
+    # Bbox burchagiga juda yaqin nuqta olamiz: doiraning chetidan tashqarida
+    # bo'lishi kerak (doira diametri bo'yicha bbox chegarasi 0.707d).
+    inset_x = max(1, int(box_w * 0.03))
+    inset_y = max(1, int(box_h * 0.03))
+    corners = [
+        (min_x + inset_x, min_y + inset_y),
+        (max_x - inset_x, min_y + inset_y),
+        (min_x + inset_x, max_y - inset_y),
+        (max_x - inset_x, max_y - inset_y),
+    ]
+    if not all(_is_background(pixel(x, y), base) for x, y in corners):
+        return None
+
+    diameter = min(box_w, box_h)
+    side = max(0.4, min(0.98, (diameter * MASK_SIDE_FACTOR) / float(fw)))
+    center_x = ((min_x + max_x) / 2.0) / float(fw)
+    center_y = ((min_y + max_y) / 2.0) / float(fh)
+    left = min(max(0.0, center_x - side / 2.0), 1.0 - side)
+    top = min(max(0.0, center_y - side / 2.0), 1.0 - side)
+    return round(side, 4), round(left, 4), round(top, 4)
+
+
+def _encode_rectangle(input_path, output_path, video_filter):
+    run_ffmpeg([
         FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
         "-map", "0:v:0", "-map", "0:a:0?",
@@ -1197,8 +1331,79 @@ def make_rectangle_video(input_path, output_path):
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
         output_path,
-    ]
-    run_ffmpeg(command)
+    ])
+
+
+def rectangle_crop_box(input_path, info):
+    """Kesish kvadratini qaytaradi: (tomon, x, y) ulushlarda yoki None.
+
+    Dumaloq (kvadrat) videoda Telegram faqat doirani ko'rsatadi, ya'ni
+    doiraga ichki chizilgan kvadrat — videoning ko'rinadigan qismi. Shuning
+    uchun kvadrat videoda HAR DOIM shu qism kesiladi: natija foni qanday
+    bo'lishidan (oq, xira, qora) qat'i nazar bir xil bo'ladi. Doira markazi
+    siljigan bo'lsa, uni aniqlab, kesishni o'sha markazga qo'yamiz.
+    """
+    if not info:
+        return None
+    width, height = info[0], info[1]
+    if not width or not height:
+        return None
+    if abs(width - height) > max(6, width * 0.08):
+        return None  # kvadrat emas — oddiy video, tegilmaydi
+
+    box = mask_crop_box(input_path, info)
+    if box:
+        # Niqob aniqlandi: kesish o'lchami doiraning o'zidan hisoblangan,
+        # markazi ham o'sha — hech narsani kattalashtirmaymiz.
+        side, left, top = box
+        side = min(side, 0.78)
+        left = min(max(0.0, left), 1.0 - side)
+        top = min(max(0.0, top), 1.0 - side)
+        return round(side, 4), round(left, 4), round(top, 4)
+
+    margin = (1 - RECT_CROP_FACTOR) / 2
+    return round(RECT_CROP_FACTOR, 4), round(margin, 4), round(margin, 4)
+
+
+def make_rectangle_video(input_path, output_path):
+    """Dumaloq videoni to'rtburchak (oddiy) videoga aylantiradi.
+
+    - Kvadrat (dumaloq) video: doiraga ichki chizilgan kvadrat kesiladi —
+      natija toza to'rtburchak, fon rangi qanday bo'lishidan qat'i nazar.
+    - Oddiy (kvadrat bo'lmagan) video: tegilmaydi, tez nusxa qilinadi.
+    """
+    info = probe_video(input_path)
+
+    box = rectangle_crop_box(input_path, info)
+    if box:
+        side, left, top = box
+        print(
+            f"[RECT] dumaloq qism kesiladi: tomon {side:.2f}, "
+            f"x {left:.2f}, y {top:.2f}"
+        )
+        _encode_rectangle(
+            input_path,
+            output_path,
+            (
+                f"crop='trunc(iw*{side}/2)*2':'trunc(ih*{side}/2)*2':"
+                f"'trunc(iw*{left}/2)*2':'trunc(ih*{top}/2)*2',"
+                "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+                "setsar=1,format=yuv420p"
+            ),
+        )
+        return
+
+    if can_remux(input_path, max_width=1920):
+        print("[RECT] qayta kodlanmaydi (tez nusxa)")
+        remux_video(input_path, output_path)
+        return
+
+    _encode_rectangle(
+        input_path,
+        output_path,
+        "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+        "setsar=1,format=yuv420p",
+    )
 
 
 # --- KO'P VAZIFALI ISHCHI (bir vaqtda cheklangan miqdorda konvertatsiya) ---
@@ -1498,30 +1703,62 @@ def file_download_url(file_path):
 
 
 def download_media(file_id, dest_path):
-    """Faylni Telegram'dan diskka oqim bilan yozadi.
+    """Faylni Telegram'dan diskka oqim bilan yozadi (tarmoq xatosida qayta urinadi).
 
     bot.download_file() butun faylni xotiraga oladi — 100 MB+ videoda bu
     serverni o'ldiradi. Shuning uchun bo'lak-bo'lak yozamiz.
-    """
-    file_info = bot.get_file(file_id)
-    file_path = getattr(file_info, "file_path", None)
-    if not file_path:
-        raise RuntimeError("fayl yo'li topilmadi")
-    url = file_download_url(file_path)
 
+    Telegram tez-tez 502/504 va read timeout qaytaradi (ayniqsa yuklama
+    ko'p bo'lganda). Ilgari bitta urinishda yiqilib, foydalanuvchi
+    "xatolik yuz berdi" olardi — endi 4 marta, ortib boruvchi kutish bilan
+    qayta urinamiz.
+    """
     last_error = None
-    for attempt in range(2):
+    for attempt in range(4):
         try:
+            file_info = bot.get_file(file_id)
+            file_path = getattr(file_info, "file_path", None)
+            if not file_path:
+                raise RuntimeError("fayl yo'li topilmadi")
+            url = file_download_url(file_path)
             with urllib.request.urlopen(url, timeout=SEND_TIMEOUT) as response:
                 with open(dest_path, "wb") as target:
                     shutil.copyfileobj(response, target, length=1024 * 512)
             if os.path.getsize(dest_path) > 0:
                 return dest_path
             raise RuntimeError("bo'sh fayl yuklandi")
-        except Exception as error:  # qayta urinamiz — tarmoq uzilishi bo'lishi mumkin
+        except ApiTelegramException as error:
+            code = getattr(error, "error_code", 0) or 0
+            text = str(error).lower()
             last_error = error
-            time.sleep(2)
-    raise RuntimeError(f"faylni yuklab bo'lmadi: {last_error}")
+            if code == 400 and "too big" in text:
+                # Bu xato qayta urinishdan o'zgarmaydi.
+                raise RuntimeError("fayl Telegram chegarasidan katta") from error
+            if code == 429:
+                time.sleep(retry_after(error, 5))
+            elif code < 500 and code != 400:
+                raise  # 401/403 kabi xatolar — qayta urinish foydasiz
+        except Exception as error:  # noqa: BLE001 - tarmoq uzilishi, timeout
+            last_error = error
+
+        # Qisman yuklangan fayl qolmasin.
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+
+        delay = min(30, 2 ** (attempt + 1))
+        print(
+            f"[DOWNLOAD] urinish {attempt + 1}/4 xato: "
+            f"{str(last_error)[:120]} — {delay}s dan keyin qayta"
+        )
+        if attempt < 3:
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Telegram serveri javob bermadi ({str(last_error)[:90]}). "
+        "Qayta urinib ko'ring."
+    )
 
 
 def conversion_job(message, kind, status_message_id):
@@ -1620,7 +1857,14 @@ def conversion_job(message, kind, status_message_id):
             "❌ Videoni qayta ishlashda xatolik yuz berdi.\n"
             "Iltimos, boshqa video bilan qayta urinib ko'ring."
         )
-        if isinstance(error, RuntimeError) and "juda uzoq" in str(error):
+        reason_text = str(error).lower()
+        if "javob bermadi" in reason_text or "timed out" in reason_text:
+            text = (
+                "⏳ Telegram serveri vaqtincha javob bermadi (504/502).\n\n"
+                "Bu sizning videongizda muammo emas — serverdagi yuklama "
+                "tufayli bo'ladi. 1-2 daqiqadan so'ng <b>qayta yuboring</b>."
+            )
+        elif isinstance(error, RuntimeError) and "juda uzoq" in str(error):
             text = "❌ Video juda uzun, qayta ishlash to'xtatildi. Qisqaroq video yuboring."
         elif isinstance(error, RuntimeError) and "juda katta" in str(error):
             text = (
@@ -1631,7 +1875,7 @@ def conversion_job(message, kind, status_message_id):
         if user_id in ADMIN_IDS:
             reason = str(error)[:280].replace("<", "&lt;").replace(">", "&gt;")
             text += f"\n\n<i>Sabab: {reason}</i>"
-        safe_edit(chat_id, status_message_id, text)
+        safe_edit(chat_id, status_message_id, text, parse_mode="HTML")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         release_user(user_id)
@@ -3047,6 +3291,16 @@ def _poll_once(offset):
         )
 
 
+def poll_retry_delay():
+    """Xato ketma-ket takrorlansa kutishni oshiradi: 5, 10, 20, 40, 60 s.
+
+    Telegram butunlay javob bermay qolganda (502/504 bo'roni) har 5 sekundda
+    urinish faqat log va tarmoqni to'ldiradi.
+    """
+    streak = max(1, int(STATE.get("poll_fail_streak") or 1))
+    return min(60, 5 * (2 ** min(streak - 1, 4)))
+
+
 def watchdog_loop():
     """Polling umuman javob bermay qolsa adminni ogohlantiradi va logga yozadi.
 
@@ -3055,19 +3309,35 @@ def watchdog_loop():
     ko'rsatadi (masalan, Telegram bloklangan yoki token boshqa joyda).
     """
     last_alert = 0.0
+    was_down = False
     while True:
         time.sleep(60)
         try:
             last = STATE["last_poll_ok"] or STARTED_AT
             idle = time.time() - last
             if idle < 180:
+                if was_down:
+                    # Aloqa tiklandi — adminni bir marta xabardor qilamiz.
+                    was_down = False
+                    last_alert = 0.0
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            bot.send_message(
+                                admin_id,
+                                "✅ Aloqa tiklandi — bot yana yangilanish olmoqda. "
+                                f"[BUILD {BUILD_VERSION}]",
+                            )
+                        except Exception:
+                            pass
                 continue
+            was_down = True
             pending = telegram_pending_count()
             print(
                 f"[WATCHDOG] {int(idle)}s davomida Telegramdan javob yo'q "
                 f"(navbatda {pending} ta) — sabab: {STATE['last_poll_note']}"
             )
-            if time.time() - last_alert > 900:
+            # Bir marta ogohlantiramiz, keyin 30 daqiqada bir marta.
+            if time.time() - last_alert > 1800:
                 last_alert = time.time()
                 for admin_id in ADMIN_IDS:
                     try:
@@ -3346,15 +3616,20 @@ def main():
             if code in (401, 404):
                 print(f"[POLL] Token qabul qilinmadi ({code}). To'xtatildi.")
                 sys.exit(1)
-            print(f"[POLL] Telegram xatosi {code}: {error}. 5 s dan keyin qayta...")
-            time.sleep(5)
+            STATE["poll_fail_streak"] += 1
+            delay = poll_retry_delay()
+            print(f"[POLL] Telegram xatosi {code}: {error}. {delay} s dan keyin qayta...")
+            time.sleep(delay)
             continue
         except Exception as error:  # noqa: BLE001 - bot hech qachon o'chmasin
             STATE["last_poll_note"] = f"tarmoq: {str(error)[:100]}"
-            print(f"[POLL] Tarmoq xatosi: {error}. 5 s dan keyin qayta...")
-            time.sleep(5)
+            STATE["poll_fail_streak"] += 1
+            delay = poll_retry_delay()
+            print(f"[POLL] Tarmoq xatosi: {error}. {delay} s dan keyin qayta...")
+            time.sleep(delay)
             continue
 
+        STATE["poll_fail_streak"] = 0
         STATE["last_poll_ok"] = time.time()
         STATE["last_poll_note"] = f"ok ({len(updates)} ta)"
         if not updates:
