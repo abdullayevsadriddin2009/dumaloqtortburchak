@@ -239,7 +239,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-10.30"
+BUILD_VERSION = "2026-11-11.01"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1052,7 +1052,8 @@ def remux_video(input_path, output_path):
 SQUARE_COVER_MIN = 0.8
 SQUARE_COVER_MAX = 1.25
 # auto | cover | fit  (muhit o'zgaruvchisi bilan majburlash mumkin)
-SQUARE_MODE = (_env("SQUARE_MODE") or "auto").strip().lower()
+# Standart: cover — doira chetlarigacha to'liq qoplanadi (xira hoshiya yo'q).
+SQUARE_MODE = (_env("SQUARE_MODE") or "cover").strip().lower()
 
 
 def square_mode(width, height):
@@ -1082,13 +1083,16 @@ def square_filter(size, mode, trim=""):
         )
     # fit: butun kadr o'rtada, atrofi shu videoning xiralashtirilgan nusxasi.
     # Na cho'ziladi, na kesiladi — dumaloqning chetlari ham bo'sh qolmaydi.
+    # Xira fon kichik o'lchamda yasaladi (48px) va keyin kattalashtiriladi —
+    # ko'zga farqi yo'q, lekin katta kadrda gblur'dan bir necha barobar tez.
     return (
         head +
         "split=2[bg][fg];"
-        f"[bg]scale={size}:{size}:force_original_aspect_ratio=increase,"
-        f"crop={size}:{size},gblur=sigma=24,eq=brightness=-0.10[bgb];"
+        "[bg]scale=48:48:force_original_aspect_ratio=increase,crop=48:48,"
+        "gblur=sigma=3,scale=" + str(size) + ":" + str(size) + ":flags=bilinear,"
+        "eq=brightness=-0.10[bgb];"
         f"[fg]scale={size}:{size}:force_original_aspect_ratio=decrease:"
-        "flags=lanczos[fgs];"
+        "flags=bilinear[fgs];"
         "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[v]"
     )
 
@@ -1148,6 +1152,12 @@ def make_square_video(input_path, output_path):
         print(f"[SQUARE] butun kadr saqlanadi ({eff_w}x{eff_h}, xira fon bilan)")
     duration = info[2] if info else 0
 
+    # Hajm chegarasi: davomiylikdan kelib chiqib, kerakli bitrate'ni OLDINDAN
+    # hisoblaymiz — shunda odatda bitta o'tishda 12 MB ichida qolamiz.
+    seconds = max(1.0, min(duration or 59.0, 59.0))
+    budget_kbps = int((NOTE_SAFE_BYTES * 8 / 1000.0) / seconds - 96)
+    budget_kbps = max(150, budget_kbps)
+
     def build(rate_args, size):
         return [
             FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
@@ -1157,24 +1167,28 @@ def make_square_video(input_path, output_path):
             "-filter_complex", square_filter(size, mode, trim),
             # veryfast + crf 17: o'lchovda "fast/crf18" dan ~3.5x tez,
             # sifat deyarli bir xil (SSIM 0.9975 / 0.9980)
-            "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-threads", "2",
+            "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-threads", "0",
             "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "96k",
             "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
             output_path,
         ]
 
-    # 1-urinish: eng yaxshi sifat (crf 17). Kichik/qisqa videolar shu bilan
-    # 12 MB ichida qoladi va hech narsa yo'qotmaydi.
-    run_ffmpeg(build(["-crf", "17"], SQUARE_SIZE))
+    # 1-urinish: eng yaxshi sifat (crf 20) + bitrate shifti. crf sifatni
+    # saqlaydi, maxrate esa fayl 12 MB dan oshib ketmasligini kafolatlaydi —
+    # shu sabab odatda bitta kodlash yetadi (tez).
+    run_ffmpeg(build([
+        "-crf", "20",
+        "-maxrate", f"{int(budget_kbps * 1.6)}k",
+        "-bufsize", f"{budget_kbps * 2}k",
+    ], SQUARE_SIZE))
     if os.path.getsize(output_path) <= NOTE_SAFE_BYTES:
         return
 
     # 2-urinish: hajm sig'madi — davomiylikka qarab bitrate hisoblab siqamiz.
     # Kadr kesilmaydi: faqat sifat/hajm moslanadi, dumaloq videoning asosiy
     # qismi to'liq saqlanadi.
-    seconds = max(1, min(duration or 59, 59))
-    video_kbps = int((NOTE_SAFE_BYTES * 8 / 1000.0) / seconds - 96)
+    video_kbps = budget_kbps
 
     # Natija haqiqatan 12 MB dan kichik bo'lguncha siqamiz. Har safar
     # o'lchangan natijaga qarab keyingi bitrate'ni tuzatamiz — shuning uchun
@@ -1320,15 +1334,16 @@ def mask_crop_box(input_path, info):
     return round(side, 4), round(left, 4), round(top, 4)
 
 
-def _encode_rectangle(input_path, output_path, video_filter):
+def _encode_rectangle(input_path, output_path, video_filter, rate_args=()):
     run_ffmpeg([
         FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", video_filter,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-threads", "2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "0",
+        *rate_args,
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
         output_path,
     ])
@@ -1365,6 +1380,21 @@ def rectangle_crop_box(input_path, info):
     return round(RECT_CROP_FACTOR, 4), round(margin, 4), round(margin, 4)
 
 
+RECT_MAX_MB = 45  # Telegram bot 50 MB gacha yuklaydi; zaxira bilan 45
+
+
+def rectangle_rate_args(info):
+    """Uzun videoni 50 MB ichida ushlash uchun bitrate hisoblagichi."""
+    if not info or not info[2]:
+        return ()
+    seconds = max(1.0, float(info[2]))
+    kbps = int((RECT_MAX_MB * 1024 * 1024 * 8 / 1000.0) / seconds - 128)
+    if kbps >= 4000:
+        return ()  # qisqa video — sifat cheklanmaydi
+    kbps = max(300, kbps)
+    return ("-b:v", f"{kbps}k", "-maxrate", f"{int(kbps * 1.2)}k", "-bufsize", f"{kbps * 2}k")
+
+
 def make_rectangle_video(input_path, output_path):
     """Dumaloq videoni to'rtburchak (oddiy) videoga aylantiradi.
 
@@ -1390,6 +1420,7 @@ def make_rectangle_video(input_path, output_path):
                 "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
                 "setsar=1,format=yuv420p"
             ),
+            rectangle_rate_args(info),
         )
         return
 
@@ -1403,6 +1434,7 @@ def make_rectangle_video(input_path, output_path):
         output_path,
         "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
         "setsar=1,format=yuv420p",
+        rectangle_rate_args(info),
     )
 
 
@@ -2304,12 +2336,65 @@ def handle_audio_edit_range(message):
     )
 
 
+AUDIO_EXTENSIONS = (
+    ".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".aac", ".flac", ".wma",
+)
+
+
+def audio_media_of(message):
+    """Xabardagi musiqa/ovoz faylini qaytaradi (audio yoki audio hujjat)."""
+    audio = getattr(message, "audio", None)
+    if audio is not None:
+        return audio
+    document = getattr(message, "document", None)
+    if document is None:
+        return None
+    mime = (getattr(document, "mime_type", "") or "").lower()
+    name = (getattr(document, "file_name", "") or "").lower()
+    if mime.startswith("audio/") or name.endswith(AUDIO_EXTENSIONS):
+        return document
+    return None
+
+
 @bot.message_handler(content_types=["audio", "document"], chat_types=["private"])
 def handle_audio_document(message):
-    """Birlashtirish kutilyotgan bo'lsa, ikkinchi faylni qabul qiladi."""
+    """Musiqa/ovoz fayli: effekt va tahrirlash menyusini ko'rsatadi.
+
+    Birlashtirish kutilyotgan bo'lsa, avval shu ishlaydi (ikkinchi fayl).
+    """
     item = take_pending(message.from_user.id, op="merge")
     if item is not None:
         start_merge_with(message, item)
+        return
+
+    media = audio_media_of(message)
+    if media is None:
+        return  # audio emas (masalan, rasm hujjati) — e'tiborsiz qoldiramiz
+
+    size = getattr(media, "file_size", 0) or 0
+    if size > MAX_INPUT_MB * 1024 * 1024:
+        bot.reply_to(
+            message,
+            f"❌ Fayl {MAX_INPUT_MB} MB dan katta — Telegram bot bunday faylni "
+            "yuklab ololmaydi. Kichikroq fayl yuboring.",
+        )
+        return
+
+    duration = getattr(media, "duration", 0) or 0
+    sent = bot.reply_to(
+        message,
+        "🎧 <b>Musiqa/ovoz qabul qilindi</b>"
+        + (f" ({format_duration(duration)})" if duration else "")
+        + "\n\nQuyidagilardan birini tanlang:",
+        parse_mode="HTML",
+        reply_markup=audio_keyboard(),
+    )
+    if len(effect_sources) > 1000:
+        effect_sources.clear()
+    chat_id = getattr(message.chat, "id", None)
+    message_id = getattr(sent, "message_id", None)
+    if chat_id is not None and message_id is not None:
+        effect_sources[(chat_id, message_id)] = media
 
 
 # --- HAVOLADAN VIDEO YUKLASH (Instagram, TikTok, Facebook...) ---
