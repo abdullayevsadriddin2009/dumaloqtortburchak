@@ -239,7 +239,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-11.01"
+BUILD_VERSION = "2026-11-11.07"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1049,6 +1049,45 @@ def remux_video(input_path, output_path):
 # Kvadratga sig'maydigan videolar uchun chegara: shu oraliqda bo'lsa
 # markazdan kesiladi (kadr deyarli to'rtburchak edi), aks holda butun kadr
 # o'rtaga qo'yiladi (atrofi xira fon bilan) — hech narsa kesilmaydi.
+# Render Free = 0.1 CPU. Shunday muhitda x264 "ultrafast" ~3 barobar tez
+# ishlaydi, 1 yadro uchun ko'p oqim esa faqat sekinlashtiradi.
+def detected_cpu_share():
+    """Konteynerga berilgan haqiqiy CPU ulushi (Render Free = 0.1).
+
+    os.cpu_count() konteynerda ko'p ko'rsatishi mumkin, lekin amalda ulush
+    kichik bo'ladi — shuning uchun cgroup cheklovini o'qiymiz.
+    """
+    try:  # cgroup v2
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as handle:
+            quota, period = handle.read().split()[:2]
+        if quota != "max":
+            return max(0.1, int(quota) / float(period))
+    except Exception:
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as handle:
+            quota = int(handle.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as handle:
+            period = int(handle.read().strip())
+        if quota > 0 and period > 0:
+            return max(0.1, quota / float(period))
+    except Exception:
+        pass
+    return float(os.cpu_count() or 1)
+
+
+CPU_COUNT = detected_cpu_share()
+LOW_CPU = CPU_COUNT < 1.5
+ENCODE_PRESET = "ultrafast" if LOW_CPU else "veryfast"
+ENCODE_THREADS = "1" if LOW_CPU else str(max(1, min(4, int(CPU_COUNT))))
+# Kuchsiz CPU da kadr chastotasini 24 ga tushiramiz — vaqt ~25% qisqaradi,
+# dumaloq videoda ko'zga deyarli sezilmaydi.
+FPS_CAP = 24 if LOW_CPU else 30
+print(
+    f"[CPU] {CPU_COUNT:.2f} ulush -> preset {ENCODE_PRESET}, "
+    f"threads {ENCODE_THREADS}, fps {FPS_CAP}"
+)
+
 SQUARE_COVER_MIN = 0.8
 SQUARE_COVER_MAX = 1.25
 # auto | cover | fit  (muhit o'zgaruvchisi bilan majburlash mumkin)
@@ -1074,6 +1113,7 @@ def square_filter(size, mode, trim=""):
         "[0:v]" + trim +
         # SAR normallashtirish: 16:15, 2:1 kabi nisbatlar cho'zilib ketmasin.
         "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1,"
+        f"fps={FPS_CAP},"
     )
     if mode == "cover":
         return (
@@ -1167,7 +1207,8 @@ def make_square_video(input_path, output_path):
             "-filter_complex", square_filter(size, mode, trim),
             # veryfast + crf 17: o'lchovda "fast/crf18" dan ~3.5x tez,
             # sifat deyarli bir xil (SSIM 0.9975 / 0.9980)
-            "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-threads", "0",
+            "-c:v", "libx264", "-preset", ENCODE_PRESET, *rate_args,
+            "-threads", ENCODE_THREADS,
             "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "96k",
             "-movflags", "+faststart", "-max_muxing_queue_size", "1024",
@@ -1179,7 +1220,7 @@ def make_square_video(input_path, output_path):
     # shu sabab odatda bitta kodlash yetadi (tez).
     run_ffmpeg(build([
         "-crf", "20",
-        "-maxrate", f"{int(budget_kbps * 1.6)}k",
+        "-maxrate", f"{int(budget_kbps * 1.1)}k",
         "-bufsize", f"{budget_kbps * 2}k",
     ], SQUARE_SIZE))
     if os.path.getsize(output_path) <= NOTE_SAFE_BYTES:
@@ -1340,7 +1381,8 @@ def _encode_rectangle(input_path, output_path, video_filter, rate_args=()):
         "-i", input_path,
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", video_filter,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "0",
+        "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", "20",
+        "-threads", ENCODE_THREADS,
         *rate_args,
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
@@ -1801,6 +1843,24 @@ def conversion_job(message, kind, status_message_id):
     input_path = os.path.join(workdir, "input.mp4")
     output_path = os.path.join(workdir, "output.mp4")
 
+    # Jarayon davomida vaqt ko'rsatib turamiz — foydalanuvchi "qotib qoldi"
+    # deb o'ylamasligi uchun (Render Free'da kodlash uzoq davom etadi).
+    started_at = time.time()
+    stop_ticker = threading.Event()
+
+    def progress_loop():
+        while not stop_ticker.wait(15):
+            minutes, seconds = divmod(int(time.time() - started_at), 60)
+            safe_edit(
+                chat_id,
+                status_message_id,
+                f"⏳ <b>Qayta ishlanmoqda...</b> {minutes}:{seconds:02d}\n"
+                "<i>Tayyor bo'lgach shu yerga yuboraman.</i>",
+                parse_mode="HTML",
+            )
+
+    threading.Thread(target=progress_loop, daemon=True).start()
+
     try:
         download_media(media.file_id, input_path)
 
@@ -1829,6 +1889,7 @@ def conversion_job(message, kind, status_message_id):
                         chat_id,
                         video_file,
                         length=note_length,  # fayl o'lchamiga mos bo'lishi shart
+                        reply_markup=audio_keyboard(),
                         reply_to_message_id=message.message_id,
                         timeout=SEND_TIMEOUT,
                     )
@@ -1909,6 +1970,7 @@ def conversion_job(message, kind, status_message_id):
             text += f"\n\n<i>Sabab: {reason}</i>"
         safe_edit(chat_id, status_message_id, text, parse_mode="HTML")
     finally:
+        stop_ticker.set()
         shutil.rmtree(workdir, ignore_errors=True)
         release_user(user_id)
 
@@ -1960,15 +2022,18 @@ def audio_job(chat_id, user_id, video):
 
 
 def handle_extract_audio(call):
-    video = getattr(call.message, "video", None)
-    if video is None:
+    media = effect_sources.get(
+        (call.message.chat.id, call.message.message_id)
+    ) or media_from_message(call.message)
+    if media is None:
         safe_answer(
-            call, "❌ Ovozni faqat video ostidagi tugma orqali ajratish mumkin.",
+            call,
+            "❌ Fayl topilmadi — tugmani video yoki musiqa ostidan bosing.",
             show_alert=True,
         )
         return
 
-    size = getattr(video, "file_size", 0) or 0
+    size = getattr(media, "file_size", 0) or 0
     if size > MAX_INPUT_MB * 1024 * 1024:
         safe_answer(
             call,
@@ -1984,7 +2049,7 @@ def handle_extract_audio(call):
         return
 
     safe_answer(call, "🎧 Ovoz ajratilmoqda, biroz kuting...")
-    executor.submit(audio_job, call.message.chat.id, user_id, video)
+    executor.submit(audio_job, call.message.chat.id, user_id, media)
 
 
 # --- AUDIO AMALLARI (ffmpeg) ---
@@ -2178,7 +2243,9 @@ def take_pending(user_id, op=None):
 
 def open_audio_menu(call, menu):
     """Effektlar yoki tahrirlash menyusini ochadi."""
-    media = media_from_message(call.message)
+    media = effect_sources.get(
+        (call.message.chat.id, call.message.message_id)
+    ) or media_from_message(call.message)
     if media is None:
         safe_answer(
             call,
@@ -2454,7 +2521,7 @@ def fit_for_telegram(input_path, workdir, limit_mb=None):
             FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
             "-i", input_path,
             "-vf", f"scale=-2:'min({height},ih)':flags=lanczos,setsar=1,format=yuv420p",
-            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+            "-c:v", "libx264", "-preset", ENCODE_PRESET, "-threads", ENCODE_THREADS,
             "-b:v", f"{video_kbps}k", "-maxrate", f"{int(video_kbps * 1.4)}k",
             "-bufsize", f"{video_kbps * 2}k",
             "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
@@ -3558,40 +3625,21 @@ def status_handler(message):
 
 
 # --- MAIN ---
-def main():
+def startup_tasks():
+    """Telegram sozlamalari — fonda, pollingni bloklamaydi.
+
+    Bu so'rovlar sekin javob bersa (Render sovuq start) bot baribir darhol
+    ishlaydi: foydalanuvchi xabarlari kutib qolmaydi.
+    """
     global BOT_USERNAME
-
-    if not BOT_TOKEN:
-        print(
-            "❌ BOT_TOKEN topilmadi.\n"
-            "\nRender'da (bir marta qilinadi):\n"
-            "  1) Dashboard -> botingiz (Web Service) -> chap menyuda 'Environment'\n"
-            "  2) 'Add Environment Variable' -> Key: BOT_TOKEN, Value: @BotFather bergan token\n"
-            "  3) Yana bittasi -> Key: ADMIN_ID, Value: sizning Telegram ID ingiz (/id)\n"
-            "  4) 'Save Changes' -> Render o'zi qayta deploy qiladi\n"
-            "\nKompyuterda ishlatayotgan bo'lsangiz: bot.py yonida .env fayl yarating:\n"
-            "  BOT_TOKEN=...\n"
-            "  ADMIN_ID=...\n"
-        )
-        sys.exit(1)
-    if not ADMIN_IDS:
-        print("⚠️ ADMIN_ID topilmadi — admin panel ishlamaydi.")
-
-    print(f"FFmpeg: {FFMPEG_PATH} | mavjud: {ffmpeg_ready()}")
-
-    threading.Thread(target=run_health_server, daemon=True).start()
-    print(f"Health-check server {PORT}-portda ishga tushdi.")
-    threading.Thread(target=watchdog_loop, daemon=True).start()
-    print("Watchdog ishga tushdi (qotib qolgan pollingni o'zi tiklaydi).")
 
     try:
         bot.remove_webhook()
     except Exception as error:
         print(f"[WEBHOOK] tozalanmadi: {error}")
 
-    # Diagnostika: logda callback_query ko'rinmasa, tugmalar ishlamaydi.
     try:
-        info = bot.get_webhook_info()
+        info = bot.get_webhook_info(timeout=10)
         print(f"[TG] allowed_updates: {info.allowed_updates}")
     except Exception as error:
         print(f"[WEBHOOK INFO] {error}")
@@ -3626,22 +3674,19 @@ def main():
     except Exception as error:
         print(f"[COMMANDS] {error}")
 
-    # Bot tavsifi (BotFather'dagi "What can this bot do?" va profil matni)
     try:
         bot.set_my_description(
-            "🎥 Videoni dumaloq ⇄ to'rtburchak qilib beraman.\n"
+            "🎥 Videoni dumaloq \u21c4 to'rtburchak qilib beraman.\n"
             "🎧 Video ovozini alohida mp3 qilib ajrataman.\n"
             "⬇️ Instagram, YouTube, TikTok havolalaridan video yuklayman.\n\n"
             "Videoni yoki havolani shunchaki yuboring!"
         )
         bot.set_my_short_description(
-            "Dumaloq ⇄ to'rtburchak video, ovozni ajratish va havoladan yuklash."
+            "Dumaloq \u21c4 to'rtburchak video, ovozni ajratish va havoladan yuklash."
         )
     except Exception as error:
         print(f"[DESCRIPTION] {error}")
 
-    # Admin deploydan keyin darhol bilishi uchun (sendMessage getUpdates'ga
-    # bog'liq emas — polling qotib qolsa ham yetib boradi).
     for admin_id in ADMIN_IDS:
         try:
             bot.send_message(
@@ -3649,12 +3694,41 @@ def main():
                 "✅ <b>Bot ishga tushdi</b>\n"
                 f"▪️ Build: <code>{BUILD_VERSION}</code>\n"
                 f"▪️ Bot: @{BOT_USERNAME or '-'}\n"
-                f"▪️ Holatni ko'rish: /status",
+                "▪️ Holatni ko'rish: /status",
                 parse_mode="HTML",
             )
             break
         except Exception as error:
             print(f"[BOOT] xabar yuborilmadi: {error}")
+
+
+def main():
+    global BOT_USERNAME
+
+    if not BOT_TOKEN:
+        print(
+            "❌ BOT_TOKEN topilmadi.\n"
+            "\nRender'da (bir marta qilinadi):\n"
+            "  1) Dashboard -> botingiz (Web Service) -> chap menyuda 'Environment'\n"
+            "  2) 'Add Environment Variable' -> Key: BOT_TOKEN, Value: @BotFather bergan token\n"
+            "  3) Yana bittasi -> Key: ADMIN_ID, Value: sizning Telegram ID ingiz (/id)\n"
+            "  4) 'Save Changes' -> Render o'zi qayta deploy qiladi\n"
+            "\nKompyuterda ishlatayotgan bo'lsangiz: bot.py yonida .env fayl yarating:\n"
+            "  BOT_TOKEN=...\n"
+            "  ADMIN_ID=...\n"
+        )
+        sys.exit(1)
+    if not ADMIN_IDS:
+        print("⚠️ ADMIN_ID topilmadi — admin panel ishlamaydi.")
+
+    print(f"FFmpeg: {FFMPEG_PATH} | mavjud: {ffmpeg_ready()}")
+
+    threading.Thread(target=run_health_server, daemon=True).start()
+    print(f"Health-check server {PORT}-portda ishga tushdi.")
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+    print("Watchdog ishga tushdi (qotib qolgan pollingni o'zi tiklaydi).")
+
+    threading.Thread(target=startup_tasks, daemon=True).start()
 
     print(f"Bot muvaffaqiyatli ishga tushdi... [BUILD {BUILD_VERSION}]")
     if free_proxy_enabled():
