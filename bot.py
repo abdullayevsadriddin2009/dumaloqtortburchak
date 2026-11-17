@@ -239,7 +239,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-11.07"
+BUILD_VERSION = "2026-11-11.09"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1078,7 +1078,11 @@ def detected_cpu_share():
 
 CPU_COUNT = detected_cpu_share()
 LOW_CPU = CPU_COUNT < 1.5
-ENCODE_PRESET = "ultrafast" if LOW_CPU else "veryfast"
+# Sifat birinchi o'rinda: "ultrafast" deblocking/CABAC ni o'chiradi va natija
+# xira/katak ko'rinadi. Shuning uchun har doim "veryfast" + CRF 18 — bu
+# amalda "asl sifat" darajasi, tezlik esa bitta kodlash hisobiga yetarli.
+ENCODE_PRESET = "veryfast"
+VIDEO_CRF = "18"
 ENCODE_THREADS = "1" if LOW_CPU else str(max(1, min(4, int(CPU_COUNT))))
 # Kuchsiz CPU da kadr chastotasini 24 ga tushiramiz — vaqt ~25% qisqaradi,
 # dumaloq videoda ko'zga deyarli sezilmaydi.
@@ -1219,7 +1223,7 @@ def make_square_video(input_path, output_path):
     # saqlaydi, maxrate esa fayl 12 MB dan oshib ketmasligini kafolatlaydi —
     # shu sabab odatda bitta kodlash yetadi (tez).
     run_ffmpeg(build([
-        "-crf", "20",
+        "-crf", VIDEO_CRF,
         "-maxrate", f"{int(budget_kbps * 1.1)}k",
         "-bufsize", f"{budget_kbps * 2}k",
     ], SQUARE_SIZE))
@@ -1381,7 +1385,7 @@ def _encode_rectangle(input_path, output_path, video_filter, rate_args=()):
         "-i", input_path,
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", video_filter,
-        "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", "20",
+        "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", VIDEO_CRF,
         "-threads", ENCODE_THREADS,
         *rate_args,
         "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
