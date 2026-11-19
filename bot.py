@@ -187,6 +187,17 @@ DOWNLOAD_TIMEOUT = _env_int("DOWNLOAD_TIMEOUT", 45)
 GETFILE_TIMEOUT = _env_int("GETFILE_TIMEOUT", 25)
 DOWNLOAD_ATTEMPTS = max(1, _env_int("DOWNLOAD_ATTEMPTS", 12))
 DOWNLOAD_DEADLINE = _env_int("DOWNLOAD_DEADLINE", 900)
+# Telegram fayl serveri bitta ulanishga ~20-30 KB/s beradi (Render'dan
+# shunday). 12 MB video shu sababli 5-8 daqiqada yuklanardi. Faylni
+# bo'laklarga bo'lib bir nechta ulanishda olsak, vaqt bir necha barobar
+# qisqaradi — har ulanish o'z bo'lagini oladi.
+DOWNLOAD_CONNECTIONS = max(1, _env_int("DOWNLOAD_CONNECTIONS", 6))
+DOWNLOAD_CHUNK_MB = max(1, _env_int("DOWNLOAD_CHUNK_MB", 2))
+DOWNLOAD_CHUNK_BYTES = DOWNLOAD_CHUNK_MB * 1024 * 1024
+# Bitta ulanishdan ma'lumot kelmay qolsa shu sekunddan keyin uziladi.
+# Ma'lumot kelayotgan bo'lsa timer qayta hisoblanadi, shuning uchun sekin
+# tarmoqda ham uzilib ketmaydi.
+DOWNLOAD_STALL_TIMEOUT = max(10, _env_int("DOWNLOAD_STALL_TIMEOUT", 30))
 AUDIO_CALLBACK = "extract_audio"
 EFFECTS_CALLBACK = "afx_menu"
 EDITS_CALLBACK = "aex_menu"
@@ -266,7 +277,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-19.05"
+BUILD_VERSION = "2026-11-19.06"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -2038,20 +2049,23 @@ def send_media_file(
     raise last_error
 
 
-def _download_stream(url, dest_path):
-    """Faylni bo'lak-bo'lak diskka yozadi; uzilsa qolgan joyidan davom etadi.
+class _RangeUnsupported(Exception):
+    """Server HTTP Range so'rovini qo'llab-quvvatlamaydi (200 qaytardi)."""
 
-    Katta videoda tarmoq uzilishi odatiy hol. Har safar faylni boshidan
-    yuklash 3-4 daqiqa yo'qotadi — shuning uchun HTTP Range bilan
-    yarim qolgan faylni to'ldiramiz. Server Range'ni qo'llab-quvvatlamasa
-    (200 qaytarsa) faylni boshidan yozamiz.
+
+def _download_stream(url, dest_path, expected=0, on_progress=None):
+    """Faylni bitta ulanishda bo'lak-bo'lak diskka yozadi.
+
+    Uzilsa qolgan joyidan davom etadi (HTTP Range): katta videoda tarmoq
+    uzilishi odatiy hol, har safar boshidan yuklash daqiqalar yo'qotadi.
+    Server Range'ni qo'llab-quvvatlamasa (200 qaytarsa) boshidan yozadi.
     """
     offset = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
     request = urllib.request.Request(url)
     if offset:
         request.add_header("Range", f"bytes={offset}-")
     try:
-        response = urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT)
+        response = urllib.request.urlopen(request, timeout=DOWNLOAD_STALL_TIMEOUT)
     except urllib.error.HTTPError as error:
         if offset and error.code == 416:
             return  # fayl allaqachon to'liq yuklangan
@@ -2060,11 +2074,134 @@ def _download_stream(url, dest_path):
         mode = "wb"
         if offset and getattr(response, "status", 200) == 206:
             mode = "ab"
+        else:
+            offset = 0
+        written = offset
         with open(dest_path, mode) as target:
-            shutil.copyfileobj(response, target, length=1024 * 512)
+            while True:
+                block = response.read(1024 * 512)
+                if not block:
+                    break
+                target.write(block)
+                written += len(block)
+                if on_progress is not None and expected:
+                    try:
+                        on_progress(min(100, int(written * 100 / expected)))
+                    except Exception:  # noqa: BLE001 - holat yangilanishi
+                        pass
 
 
-def download_media(file_id, dest_path, on_retry=None):
+def _fetch_range(url, start, end, dest_path, progress):
+    """[start, end] oraliqni yuklab, faylning aynan shu joyiga yozadi."""
+    request = urllib.request.Request(url)
+    request.add_header("Range", f"bytes={start}-{end}")
+    response = urllib.request.urlopen(request, timeout=DOWNLOAD_STALL_TIMEOUT)
+    try:
+        if getattr(response, "status", 200) != 206:
+            raise _RangeUnsupported("Range so'rovi 206 qaytarmadi")
+        with open(dest_path, "r+b") as target:
+            target.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                block = response.read(min(1024 * 256, remaining))
+                if not block:
+                    raise RuntimeError(f"oqim uzildi ({start}-{end})")
+                target.write(block)
+                remaining -= len(block)
+                progress(len(block))
+    finally:
+        response.close()
+
+
+def _download_parallel(url, dest_path, expected, on_progress=None):
+    """Faylni bir nechta ulanishda, bo'laklarga bo'lib parallel yuklaydi.
+
+    Bitta ulanish ~25 KB/s bersa, 6 ulanish olti baravar tez oladi. Har
+    bo'lak alohida urinishga ega: bittasi uzilsa faqat o'sha bo'lak qayta
+    olinadi, qolgan progress yo'qolmaydi.
+    """
+    chunk = DOWNLOAD_CHUNK_BYTES
+    ranges = [(start, min(start + chunk, expected) - 1) for start in range(0, expected, chunk)]
+    with open(dest_path, "wb") as target:
+        target.truncate(expected)
+
+    lock = threading.Lock()
+    state = {"done": 0, "next": 0, "last": time.time()}
+    errors = []
+
+    def progress(count):
+        percent = None
+        with lock:
+            state["done"] += count
+            now = time.time()
+            if on_progress is not None and (
+                now - state["last"] >= 2.0 or state["done"] >= expected
+            ):
+                state["last"] = now
+                percent = min(100, int(state["done"] * 100 / expected))
+        if percent is not None:
+            try:
+                on_progress(percent)
+            except Exception:  # noqa: BLE001 - holat yangilanishi muhim emas
+                pass
+
+    def worker():
+        while True:
+            with lock:
+                if errors or state["next"] >= len(ranges):
+                    return
+                index = state["next"]
+                state["next"] += 1
+            start, end = ranges[index]
+            for attempt in range(3):
+                try:
+                    _fetch_range(url, start, end, dest_path, progress)
+                    break
+                except _RangeUnsupported as error:
+                    with lock:
+                        errors.append(error)
+                    return
+                except Exception as error:  # noqa: BLE001 - tarmoq uzilishi
+                    if attempt >= 2:
+                        with lock:
+                            errors.append(error)
+                        return
+                    time.sleep(1 + attempt)
+
+    workers = min(DOWNLOAD_CONNECTIONS, len(ranges))
+    print(
+        f"[DOWNLOAD] {expected / 1048576:.1f} MB, {workers} ulanishda "
+        f"parallel ({len(ranges)} bo'lak)"
+    )
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    if errors:
+        raise errors[0]
+    size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+    if size != expected:
+        raise RuntimeError(f"fayl to'liq yuklanmadi ({size}/{expected})")
+
+
+def _fetch_to_disk(url, dest_path, expected, on_progress=None):
+    """Faylni diskka yozadi: kattasini parallel, kichigini bitta oqimda."""
+    if expected > DOWNLOAD_CHUNK_BYTES:
+        try:
+            _download_parallel(url, dest_path, expected, on_progress)
+            return
+        except _RangeUnsupported as error:
+            print(f"[DOWNLOAD] parallel ishlamadi ({error}) — ketma-ket yuklanadi")
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+    _download_stream(url, dest_path, expected, on_progress)
+
+
+def download_media(file_id, dest_path, on_retry=None, on_progress=None):
     """Faylni Telegram'dan diskka oqim bilan yozadi.
 
     bot.download_file() butun faylni xotiraga oladi — 100 MB+ videoda bu
@@ -2078,17 +2215,20 @@ def download_media(file_id, dest_path, on_retry=None):
       - bir marta olingan file_path saqlanadi — har urinishda getFile
         yuborilmaydi (504 aynan shundan chiqadi);
       - yarim qolgan fayl o'chirilmaydi, Range bilan davom ettiriladi;
-      - umumiy kutish chegarasi fayl hajmiga qarab (kichik video ~5 daqiqa).
+      - umumiy kutish chegarasi fayl hajmiga qarab (kichik video ~5 daqiqa);
+      - katta fayl bir nechta ulanishda parallel olinadi (tezlik uchun).
     """
     started_at = time.time()
     url = None
     expected = 0
     last_error = None
+    step = "getFile"
     # Kichik faylni 15 daqiqa kutishning ma'nosi yo'q: hajmga qarab oqilona
     # chegara (2 MB -> ~5 daqiqa, 200 MB -> 15 daqiqa).
     deadline = DOWNLOAD_DEADLINE
 
     for attempt in range(DOWNLOAD_ATTEMPTS):
+        step = "getFile" if url is None else "oqim"
         try:
             if url is None:
                 file_info = _get_file_info(file_id)
@@ -2102,7 +2242,8 @@ def download_media(file_id, dest_path, on_retry=None):
                         DOWNLOAD_DEADLINE, 300 + int(expected / 1048576) * 4
                     )
 
-            _download_stream(url, dest_path)
+            step = "oqim"
+            _fetch_to_disk(url, dest_path, expected, on_progress)
             size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
             if expected and size < expected:
                 raise RuntimeError(f"fayl to'liq yuklanmadi ({size}/{expected})")
@@ -2129,6 +2270,10 @@ def download_media(file_id, dest_path, on_retry=None):
                 url = None
         except Exception as error:  # noqa: BLE001 - tarmoq uzilishi, timeout
             last_error = error
+            # HTTP 401/403/404/410: Range URL yoki imzo eskirgan — keyingi
+            # urinishdan oldin getFile'dan yangi manzil olamiz.
+            if getattr(error, "code", 0) in (401, 403, 404, 410):
+                url = None
 
         # Dastlabki urinishlar darhol takrorlanadi: bitta osilib qolgan
         # so'rov 25 s da uziladi va keyingisi shu zahoti boshlanadi.
@@ -2145,7 +2290,8 @@ def download_media(file_id, dest_path, on_retry=None):
                 pass
         print(
             f"[DOWNLOAD] urinish {attempt + 1}/{DOWNLOAD_ATTEMPTS} xato "
-            f"({time.time() - started_at:.0f}s): {str(last_error)[:110]} — {when}"
+            f"({time.time() - started_at:.0f}s, {step}): "
+            f"{str(last_error)[:110]} — {when}"
         )
         if delay:
             time.sleep(delay)
@@ -2173,7 +2319,7 @@ def conversion_job(message, kind, status_message_id):
     stage = {"text": "⬇️ Telegram'dan yuklanmoqda..."}
 
     def progress_loop():
-        while not stop_ticker.wait(10):
+        while not stop_ticker.wait(4):
             minutes, seconds = divmod(int(time.time() - started_at), 60)
             safe_edit(
                 chat_id,
@@ -2186,12 +2332,17 @@ def conversion_job(message, kind, status_message_id):
     threading.Thread(target=progress_loop, daemon=True).start()
 
     try:
+        def note_progress(percent):
+            stage["text"] = f"⬇️ Telegram'dan yuklanmoqda... {percent}%"
+
         def note_retry(attempt, total, error):
             stage["text"] = (
                 f"⬇️ Telegram'dan yuklanmoqda... (qayta urinish {attempt}/{total})"
             )
 
-        download_media(media.file_id, input_path, on_retry=note_retry)
+        download_media(
+            media.file_id, input_path, on_retry=note_retry, on_progress=note_progress
+        )
         # Bosqichlar vaqtini logga chiqaramiz: sekinlik yuklashda, kodlashda
         # yoki yuborishda ekani darhol ko'rinadi.
         t_download = time.time()
