@@ -14,6 +14,7 @@ import json
 import os
 import random
 import urllib.error
+import urllib.parse
 import urllib.request
 import re
 import shutil
@@ -254,7 +255,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-19.03"
+BUILD_VERSION = "2026-11-19.04"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1837,12 +1838,51 @@ def file_download_url(file_path):
     return file_url.format(bot.token, file_path)
 
 
+def _api_method_url(method):
+    """API metodining to'liq manzili (apihelper.API_URL hisobga olinadi)."""
+    api_url = apihelper.API_URL or "https://api.telegram.org/bot{0}/{1}"
+    suffix = "/bot{0}/{1}"
+    if api_url.endswith(suffix):
+        base = api_url[: -len(suffix)]
+    else:
+        base = api_url.rstrip("/")
+    return f"{base}/bot{bot.token}/{method}"
+
+
 def _get_file_info(file_id):
-    """getFile so'rovi qisqa timeout bilan (telebot sukut bo'yicha 120 s kutadi)."""
+    """getFile so'rovini o'zimiz yuboramiz — qisqa timeout bilan.
+
+    telebot'ning `get_file(file_id)` funksiyasida `timeout` parametri yo'q:
+    u global `apihelper.READ_TIMEOUT` (120 s) bilan ishlaydi. Telegram 504
+    qaytargan so'rov shu sababli 2 daqiqa osilib qolardi va keyingi urinish
+    ham kech boshlanardi. Bu yerda o'sha so'rov GETFILE_TIMEOUT (25 s) bilan
+    yuboriladi — xato bo'lsa keyingi urinish darhol boshlanadi.
+    """
+    query = urllib.parse.urlencode({"file_id": file_id})
+    url = f"{_api_method_url('getFile')}?{query}"
+    payload = {}
     try:
-        return bot.get_file(file_id, timeout=GETFILE_TIMEOUT)
-    except TypeError:  # eski telebot imzosida `timeout` bo'lmasligi mumkin
-        return bot.get_file(file_id)
+        with urllib.request.urlopen(url, timeout=GETFILE_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        # Telegram xato javobi ham JSON bo'ladi; bo'lmasa oddiy matn qaytaramiz.
+        try:
+            payload = json.loads(error.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - javob JSON emas
+            payload = {
+                "ok": False,
+                "error_code": error.code,
+                "description": str(error.reason),
+            }
+    if not payload.get("ok"):
+        if not payload.get("error_code"):
+            payload = {
+                "ok": False,
+                "error_code": 502,
+                "description": "getFile: kutilmagan javob",
+            }
+        raise ApiTelegramException("getFile", None, payload)
+    return types.File.de_json(payload["result"])
 
 
 def _download_stream(url, dest_path):
@@ -1871,7 +1911,7 @@ def _download_stream(url, dest_path):
             shutil.copyfileobj(response, target, length=1024 * 512)
 
 
-def download_media(file_id, dest_path):
+def download_media(file_id, dest_path, on_retry=None):
     """Faylni Telegram'dan diskka oqim bilan yozadi.
 
     bot.download_file() butun faylni xotiraga oladi — 100 MB+ videoda bu
@@ -1943,6 +1983,13 @@ def download_media(file_id, dest_path):
         if time.time() - started_at + delay > deadline:
             break
         when = f"{delay}s dan keyin davom etadi" if delay else "darhol qayta"
+        if on_retry is not None:
+            # Foydalanuvchi "qotib qoldi" deb o'ylamasligi uchun holatda
+            # nechanchi urinish ketayotganini ko'rsatamiz.
+            try:
+                on_retry(attempt + 1, DOWNLOAD_ATTEMPTS, last_error)
+            except Exception:  # noqa: BLE001 - holat yangilanishi muhim emas
+                pass
         print(
             f"[DOWNLOAD] urinish {attempt + 1}/{DOWNLOAD_ATTEMPTS} xato "
             f"({time.time() - started_at:.0f}s): {str(last_error)[:110]} — {when}"
@@ -1986,7 +2033,12 @@ def conversion_job(message, kind, status_message_id):
     threading.Thread(target=progress_loop, daemon=True).start()
 
     try:
-        download_media(media.file_id, input_path)
+        def note_retry(attempt, total, error):
+            stage["text"] = (
+                f"⬇️ Telegram'dan yuklanmoqda... (qayta urinish {attempt}/{total})"
+            )
+
+        download_media(media.file_id, input_path, on_retry=note_retry)
         # Bosqichlar vaqtini logga chiqaramiz: sekinlik yuklashda, kodlashda
         # yoki yuborishda ekani darhol ko'rinadi.
         t_download = time.time()
