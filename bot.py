@@ -254,7 +254,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-19.02"
+BUILD_VERSION = "2026-11-19.03"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1987,6 +1987,9 @@ def conversion_job(message, kind, status_message_id):
 
     try:
         download_media(media.file_id, input_path)
+        # Bosqichlar vaqtini logga chiqaramiz: sekinlik yuklashda, kodlashda
+        # yoki yuborishda ekani darhol ko'rinadi.
+        t_download = time.time()
         stage["text"] = "⚙️ Video kodlanmoqda..."
 
         try:
@@ -1999,10 +2002,16 @@ def conversion_job(message, kind, status_message_id):
         else:
             make_rectangle_video(input_path, output_path)
 
+        t_encode = time.time()
+        output_mb = os.path.getsize(output_path) / (1024 * 1024)
+        print(
+            f"[TIME] yuklash {t_download - started_at:.0f}s | "
+            f"kodlash {t_encode - t_download:.0f}s | natija {output_mb:.1f} MB"
+        )
+
         stage["text"] = "📤 Yuborilmoqda..."
 
         # Bot API orqali yuklash chegarasi 50 MB
-        output_mb = os.path.getsize(output_path) / (1024 * 1024)
         if output_mb > MAX_SEND_MB:
             raise RuntimeError("natija juda katta")
 
@@ -2065,6 +2074,11 @@ def conversion_job(message, kind, status_message_id):
                         timeout=SEND_TIMEOUT,
                     )
                 )
+
+        print(
+            f"[SEND] tayyor: {output_mb:.1f} MB, "
+            f"{time.time() - t_encode:.0f}s, jami {time.time() - started_at:.0f}s"
+        )
 
         try:
             bot.delete_message(chat_id, status_message_id)
