@@ -10,6 +10,7 @@ shart, aks holda istalgan odam tokenni olib botni boshqaradi.
 """
 
 import html
+import http.client
 import json
 import os
 import random
@@ -25,6 +26,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -161,7 +163,16 @@ RECT_HEIGHT = 720
 MAX_SEND_MB = _env_int("MAX_SEND_MB", 1900 if LOCAL_API else 49)
 # Katta faylni yuklash/yuklab olish uzoq davom etadi — kutish vaqti ham shunga
 # mos bo'lishi kerak, aks holda ulanish uzilib qoladi.
-SEND_TIMEOUT = _env_int("SEND_TIMEOUT", 3600 if LOCAL_API else 600)
+SEND_TIMEOUT = _env_int("SEND_TIMEOUT", 3600 if LOCAL_API else 240)
+# Yuklash paytida socket jim qolsa shu sekunddan keyin uziladi. Avval
+# send_video bitta osilgan ulanishda 10 daqiqa kutib turardi — foydalanuvchi
+# esa "Yuborilmoqda..." yozuvida qotib qolardi.
+UPLOAD_TIMEOUT = _env_int("UPLOAD_TIMEOUT", 60)
+# Fayl to'liq ketgandan keyin Telegram javobini kutish. Avval bu yerda
+# SEND_TIMEOUT (240 s) turardi: server jim qolsa bot yana 4 daqiqa
+# "Yuborilmoqda..." bo'lib osilib turardi.
+SEND_RESPONSE_TIMEOUT = _env_int("SEND_RESPONSE_TIMEOUT", 600 if LOCAL_API else 120)
+SEND_ATTEMPTS = max(1, _env_int("SEND_ATTEMPTS", 4))
 # Yuklab olish uchun alohida sozlamalar. Telegram 502/504 ni tez-tez
 # qaytaradi (ayniqsa katta faylda): bir marta urinib yiqilish o'rniga
 # belgilangan vaqt ichida davom etamiz va yarim qolgan faylni
@@ -255,7 +266,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-19.04"
+BUILD_VERSION = "2026-11-19.05"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1885,6 +1896,148 @@ def _get_file_info(file_id):
     return types.File.de_json(payload["result"])
 
 
+UPLOAD_CHUNK = 64 * 1024
+
+
+def _post_multipart(
+    method,
+    fields,
+    file_field,
+    file_path,
+    on_progress=None,
+    filename="video.mp4",
+    mime="video/mp4",
+):
+    """Faylni multipart/form-data qilib, bo'lak-bo'lak yuboradi.
+
+    telebot'ning send_video'i fayl to'liq ketguncha hech qanday ma'lumot
+    bermaydi: tarmoq osilib qolsa SEND_TIMEOUT (daqiqalar) davomida jim
+    turadi va foydalanuvchi "Yuborilinmoqda..." yozuvida qotib qoladi.
+    Bu yerda har bir bo'lak yuborilganda on_progress chaqiriladi (foiz
+    ko'rinadi), jim qolgan ulanish esa UPLOAD_TIMEOUT ichida uziladi.
+    """
+    parsed = urllib.parse.urlsplit(_api_method_url(method))
+    if parsed.scheme == "https":
+        connection = http.client.HTTPSConnection(
+            parsed.hostname, parsed.port, timeout=UPLOAD_TIMEOUT
+        )
+    else:
+        connection = http.client.HTTPConnection(
+            parsed.hostname, parsed.port, timeout=UPLOAD_TIMEOUT
+        )
+    path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
+    boundary = "----dumaloq" + uuid.uuid4().hex
+    preamble = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"'
+        f"\r\n\r\n{value}\r\n".encode("utf-8")
+        for key, value in fields.items()
+        if value is not None
+    )
+    file_head = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+        f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n'
+    ).encode("utf-8")
+    tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    file_size = os.path.getsize(file_path)
+
+    try:
+        connection.putrequest("POST", path)
+        connection.putheader(
+            "Content-Type", f"multipart/form-data; boundary={boundary}"
+        )
+        connection.putheader(
+            "Content-Length", str(len(preamble) + len(file_head) + file_size + len(tail))
+        )
+        connection.putheader("Connection", "close")
+        connection.endheaders()
+        connection.send(preamble)
+        connection.send(file_head)
+
+        sent = 0
+        with open(file_path, "rb") as source:
+            while True:
+                chunk = source.read(UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                connection.send(chunk)
+                sent += len(chunk)
+                if on_progress is not None:
+                    try:
+                        on_progress(sent, file_size)
+                    except Exception:  # noqa: BLE001 - progress muhim emas
+                        pass
+        connection.send(tail)
+
+        # Fayl ketdi; endi Telegram javobini kutamiz. Bu kutish qisqa:
+        # server jim qolsa keyingi urinish darhol boshlanadi.
+        if connection.sock is not None:
+            connection.sock.settimeout(SEND_RESPONSE_TIMEOUT)
+        response = connection.getresponse()
+        raw = response.read()
+        status = response.status
+    finally:
+        connection.close()
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - javob JSON emas (proxy, 502 HTML)
+        payload = {
+            "ok": False,
+            "error_code": status if status >= 400 else 502,
+            "description": raw[:200].decode("utf-8", "replace") or "bo'sh javob",
+        }
+    if not payload.get("ok"):
+        if not payload.get("error_code"):
+            payload["error_code"] = 502
+        raise ApiTelegramException(method, None, payload)
+    return payload["result"]
+
+
+def send_media_file(
+    method, fields, file_path, file_field, on_progress=None, on_retry=None
+):
+    """Faylni bir necha marta urinish bilan yuboradi.
+
+    Har urinishda fayl qaytadan ochiladi: telebot'da muvaffaqiyatsiz
+    urinishdan keyin fayl oxirida qolib, keyingi urinish bo'sh fayl
+    yuborardi. 4xx xatolar (fayl rad etildi, huquq yo'q) takrorlanmaydi.
+    """
+    last_error = None
+    for attempt in range(SEND_ATTEMPTS):
+        try:
+            result = _post_multipart(
+                method, fields, file_field, file_path, on_progress=on_progress
+            )
+            if attempt:
+                print(f"[SEND] {method} {attempt + 1}-urinishda o'tdi")
+            return result
+        except ApiTelegramException as error:
+            last_error = error
+            code = getattr(error, "error_code", 0) or 0
+            if code == 429:
+                time.sleep(retry_after(error, 5))
+            elif code >= 500:
+                time.sleep(2 * (attempt + 1))
+            else:
+                raise
+        except (OSError, TimeoutError, http.client.HTTPException) as error:
+            last_error = error
+            time.sleep(2 * (attempt + 1))
+
+        print(
+            f"[SEND] urinish {attempt + 1}/{SEND_ATTEMPTS} xato: "
+            f"{str(last_error)[:120]}"
+        )
+        if on_retry is not None:
+            try:
+                on_retry(attempt + 2, SEND_ATTEMPTS, last_error)
+            except Exception:  # noqa: BLE001 - holat yangilanishi muhim emas
+                pass
+
+    raise last_error
+
+
 def _download_stream(url, dest_path):
     """Faylni bo'lak-bo'lak diskka yozadi; uzilsa qolgan joyidan davom etadi.
 
@@ -2067,65 +2220,74 @@ def conversion_job(message, kind, status_message_id):
         if output_mb > MAX_SEND_MB:
             raise RuntimeError("natija juda katta")
 
+        def upload_progress(sent_bytes, total_bytes):
+            if not total_bytes:
+                return
+            percent = min(100, int(sent_bytes * 100 / total_bytes))
+            stage["text"] = f"📤 Yuborilmoqda... {percent}%"
+
+        def upload_retry(attempt, total, error):
+            stage["text"] = f"📤 Yuborilmoqda... (qayta urinish {attempt}/{total})"
+
+        base_fields = {
+            "chat_id": chat_id,
+            "reply_markup": json.dumps(audio_keyboard().to_dict()),
+            "reply_to_message_id": message.message_id,
+        }
+
+        def video_fields():
+            # O'lcham va davomiylikni aniq beramiz — Telegram faylni dumaloq
+            # (video note) emas, oddiy to'rtburchak video deb ko'rsatadi.
+            fields = dict(base_fields)
+            probe = probe_video(output_path)
+            if probe:
+                fields.update(
+                    {"width": probe[0], "height": probe[1], "duration": probe[2]}
+                )
+            fields.update(
+                {
+                    "caption": build_caption("🎥 Videongiz tayyor!"),
+                    "parse_mode": "HTML",
+                    "supports_streaming": "true",
+                }
+            )
+            return fields
+
         if kind == "to_note":
             note_info = probe_video(output_path)
             note_length = note_info[0] if note_info else SQUARE_SIZE
-
-            def send():
-                with open(output_path, "rb") as video_file:
-                    return bot.send_video_note(
-                        chat_id,
-                        video_file,
-                        length=note_length,  # fayl o'lchamiga mos bo'lishi shart
-                        reply_markup=audio_keyboard(),
-                        reply_to_message_id=message.message_id,
-                        timeout=SEND_TIMEOUT,
-                    )
+            send_fields = dict(base_fields)
+            # Fayl o'lchamiga mos bo'lishi shart.
+            send_fields["length"] = note_length
+            method, file_field = "sendVideoNote", "video_note"
         else:
-            # O'lcham va davomiylikni aniq beramiz — Telegram faylni dumaloq
-            # (video note) emas, oddiy to'rtburchak video deb ko'rsatadi.
-            video_kwargs = {}
-            probe = probe_video(output_path)
-            if probe:
-                video_kwargs = {
-                    "width": probe[0],
-                    "height": probe[1],
-                    "duration": probe[2],
-                }
-
-            def send():
-                with open(output_path, "rb") as video_file:
-                    return bot.send_video(
-                        chat_id,
-                        video_file,
-                        caption=build_caption("🎥 Videongiz tayyor!"),
-                        supports_streaming=True,
-                        reply_markup=audio_keyboard(),
-                        reply_to_message_id=message.message_id,
-                        timeout=SEND_TIMEOUT,
-                        **video_kwargs,
-                    )
+            send_fields = video_fields()
+            method, file_field = "sendVideo", "video"
 
         try:
-            with_retry(send)
+            send_media_file(
+                method,
+                send_fields,
+                output_path,
+                file_field,
+                on_progress=upload_progress,
+                on_retry=upload_retry,
+            )
         except ApiTelegramException as error:
             # Telegram dumaloq videoni rad etsa (400), foydalanuvchini xato
             # bilan qoldirmaymiz — oddiy video sifatida yuboramiz.
             if kind != "to_note" or error.error_code != 400:
                 raise
             print(f"[NOTE] Telegram rad etdi, video sifatida yuborildi: {error}")
-            with open(output_path, "rb") as video_file:
-                with_retry(
-                    lambda: bot.send_video(
-                        chat_id,
-                        video_file,
-                        caption=build_caption("🎥 Videongiz tayyor!"),
-                        supports_streaming=True,
-                        reply_markup=audio_keyboard(),
-                        reply_to_message_id=message.message_id,
-                        timeout=SEND_TIMEOUT,
-                    )
-                )
+            stage["text"] = "📤 Yuborilmoqda..."
+            send_media_file(
+                "sendVideo",
+                video_fields(),
+                output_path,
+                "video",
+                on_progress=upload_progress,
+                on_retry=upload_retry,
+            )
 
         print(
             f"[SEND] tayyor: {output_mb:.1f} MB, "
