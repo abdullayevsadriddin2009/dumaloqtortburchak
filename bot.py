@@ -1942,10 +1942,10 @@ def download_media(file_id, dest_path):
         delay = 0 if attempt < 3 else min(20, 2 ** (attempt - 2))
         if time.time() - started_at + delay > deadline:
             break
+        when = f"{delay}s dan keyin davom etadi" if delay else "darhol qayta"
         print(
             f"[DOWNLOAD] urinish {attempt + 1}/{DOWNLOAD_ATTEMPTS} xato "
-            f"({time.time() - started_at:.0f}s): {str(last_error)[:110]} — "
-            f"{f'{delay}s dan keyin davom etadi' if delay else 'darhol qayta'}"
+            f"({time.time() - started_at:.0f}s): {str(last_error)[:110]} — {when}"
         )
         if delay:
             time.sleep(delay)
