@@ -13,6 +13,7 @@ import html
 import json
 import os
 import random
+import urllib.error
 import urllib.request
 import re
 import shutil
@@ -160,6 +161,13 @@ MAX_SEND_MB = _env_int("MAX_SEND_MB", 1900 if LOCAL_API else 49)
 # Katta faylni yuklash/yuklab olish uzoq davom etadi — kutish vaqti ham shunga
 # mos bo'lishi kerak, aks holda ulanish uzilib qoladi.
 SEND_TIMEOUT = _env_int("SEND_TIMEOUT", 3600 if LOCAL_API else 600)
+# Yuklab olish uchun alohida sozlamalar. Telegram 502/504 ni tez-tez
+# qaytaradi (ayniqsa katta faylda): bir marta urinib yiqilish o'rniga
+# belgilangan vaqt ichida davom etamiz va yarim qolgan faylni
+# boshidan emas, qolgan joyidan yuklaymiz.
+DOWNLOAD_TIMEOUT = _env_int("DOWNLOAD_TIMEOUT", SEND_TIMEOUT)
+DOWNLOAD_ATTEMPTS = max(1, _env_int("DOWNLOAD_ATTEMPTS", 12))
+DOWNLOAD_DEADLINE = _env_int("DOWNLOAD_DEADLINE", 900)
 AUDIO_CALLBACK = "extract_audio"
 EFFECTS_CALLBACK = "afx_menu"
 EDITS_CALLBACK = "aex_menu"
@@ -239,7 +247,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-11.09"
+BUILD_VERSION = "2026-11-19.01"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1240,11 +1248,11 @@ def make_square_video(input_path, output_path):
     # bu cheksiz "taxmin" emas, aniq tekshiruv.
     size = SQUARE_SIZE
     for attempt in range(4):
-        if video_kbps < 600:
+        # O'lchamni 512px dan pastga tushirmaymiz: 384px dumaloq video
+        # ko'zga xira ko'rinadi. Bitrate'ni kamaytirish yetarli.
+        if video_kbps < 700:
             size = 512
-        if video_kbps < 350:
-            size = 384
-        video_kbps = max(120, int(video_kbps))
+        video_kbps = max(320, int(video_kbps))
         print(
             f"[SQUARE] {os.path.getsize(output_path) / 1048576:.1f} MB — "
             f"12 MB chegarasi uchun {video_kbps} kbps, {size}px ga siqiladi "
@@ -1426,19 +1434,46 @@ def rectangle_crop_box(input_path, info):
     return round(RECT_CROP_FACTOR, 4), round(margin, 4), round(margin, 4)
 
 
-RECT_MAX_MB = 45  # Telegram bot 50 MB gacha yuklaydi; zaxira bilan 45
+# Yuborish chegarasi muhitdan olinadi: oddiy Bot API 50 MB, local Bot API
+# 2 GB. Ilgari bu yerda 45 MB qotib turardi — local API bor bo'lsa ham
+# video behuda siqilib, xira bo'lib qolardi.
+RECT_MAX_MB = max(45, min(MAX_SEND_MB - 4, 950))
+
+# Bitrate yetmasa kadr o'lchamini ham tushiramiz: 1080px ni 1 Mbit/s bilan
+# kodlasa video xira bo'ladi, o'sha bitrate'da 640px esa aniq ko'rinadi.
+# (eng kam bitrate, kenglik) — yuqoridan pastga.
+RECT_WIDTH_LADDER = ((5000, 1920), (2800, 1280), (1600, 960), (0, 640))
 
 
-def rectangle_rate_args(info):
-    """Uzun videoni 50 MB ichida ushlash uchun bitrate hisoblagichi."""
+def rectangle_bitrate_kbps(info):
+    """Uzun videoni yuborish chegarasida ushlash uchun kerakli bitrate."""
     if not info or not info[2]:
-        return ()
+        return 0
     seconds = max(1.0, float(info[2]))
-    kbps = int((RECT_MAX_MB * 1024 * 1024 * 8 / 1000.0) / seconds - 128)
-    if kbps >= 4000:
-        return ()  # qisqa video — sifat cheklanmaydi
-    kbps = max(300, kbps)
+    return int((RECT_MAX_MB * 1024 * 1024 * 8 / 1000.0) / seconds - 128)
+
+
+def rectangle_rate_args(kbps):
+    """Bitrate sharti: qisqa videoda umuman cheklamaymiz (sifat birinchi)."""
+    if kbps <= 0 or kbps >= RECT_WIDTH_LADDER[0][0]:
+        return ()
+    kbps = max(600, kbps)
     return ("-b:v", f"{kbps}k", "-maxrate", f"{int(kbps * 1.2)}k", "-bufsize", f"{kbps * 2}k")
+
+
+def rectangle_scale_width(source_width, kbps):
+    """Bitrate'ga mos kenglik; manbadan kattalashtirmaymiz."""
+    if kbps <= 0:
+        width = RECT_WIDTH_LADDER[0][1]
+    else:
+        width = RECT_WIDTH_LADDER[-1][1]
+        for limit, candidate in RECT_WIDTH_LADDER:
+            if kbps >= limit:
+                width = candidate
+                break
+    if source_width:
+        width = min(width, int(source_width))
+    return max(2, width // 2 * 2)
 
 
 def make_rectangle_video(input_path, output_path):
@@ -1449,6 +1484,8 @@ def make_rectangle_video(input_path, output_path):
     - Oddiy (kvadrat bo'lmagan) video: tegilmaydi, tez nusxa qilinadi.
     """
     info = probe_video(input_path)
+    kbps = rectangle_bitrate_kbps(info)
+    rate_args = rectangle_rate_args(kbps)
 
     box = rectangle_crop_box(input_path, info)
     if box:
@@ -1457,16 +1494,21 @@ def make_rectangle_video(input_path, output_path):
             f"[RECT] dumaloq qism kesiladi: tomon {side:.2f}, "
             f"x {left:.2f}, y {top:.2f}"
         )
+        # Kesilgandan keyingi haqiqiy kenglik — undan kattalashtirmaymiz.
+        crop_width = int(info[0] * side) if info else 0
+        width = rectangle_scale_width(crop_width, kbps)
+        if rate_args:
+            print(f"[RECT] sifat: {width}px, {max(600, kbps)} kbps")
         _encode_rectangle(
             input_path,
             output_path,
             (
                 f"crop='trunc(iw*{side}/2)*2':'trunc(ih*{side}/2)*2':"
                 f"'trunc(iw*{left}/2)*2':'trunc(ih*{top}/2)*2',"
-                "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+                f"scale=w='min({width},trunc(iw/2)*2)':h=-2:flags=lanczos,"
                 "setsar=1,format=yuv420p"
             ),
-            rectangle_rate_args(info),
+            rate_args,
         )
         return
 
@@ -1475,12 +1517,15 @@ def make_rectangle_video(input_path, output_path):
         remux_video(input_path, output_path)
         return
 
+    width = rectangle_scale_width(info[0] if info else 0, kbps)
+    if rate_args:
+        print(f"[RECT] sifat: {width}px, {max(600, kbps)} kbps")
     _encode_rectangle(
         input_path,
         output_path,
-        "scale=w='min(1920,trunc(iw/2)*2)':h=-2:flags=lanczos,"
+        f"scale=w='min({width},trunc(iw/2)*2)':h=-2:flags=lanczos,"
         "setsar=1,format=yuv420p",
-        rectangle_rate_args(info),
+        rate_args,
     )
 
 
@@ -1780,29 +1825,66 @@ def file_download_url(file_path):
     return file_url.format(bot.token, file_path)
 
 
+def _download_stream(url, dest_path):
+    """Faylni bo'lak-bo'lak diskka yozadi; uzilsa qolgan joyidan davom etadi.
+
+    Katta videoda tarmoq uzilishi odatiy hol. Har safar faylni boshidan
+    yuklash 3-4 daqiqa yo'qotadi — shuning uchun HTTP Range bilan
+    yarim qolgan faylni to'ldiramiz. Server Range'ni qo'llab-quvvatlamasa
+    (200 qaytarsa) faylni boshidan yozamiz.
+    """
+    offset = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+    request = urllib.request.Request(url)
+    if offset:
+        request.add_header("Range", f"bytes={offset}-")
+    try:
+        response = urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT)
+    except urllib.error.HTTPError as error:
+        if offset and error.code == 416:
+            return  # fayl allaqachon to'liq yuklangan
+        raise
+    with response:
+        mode = "wb"
+        if offset and getattr(response, "status", 200) == 206:
+            mode = "ab"
+        with open(dest_path, mode) as target:
+            shutil.copyfileobj(response, target, length=1024 * 512)
+
+
 def download_media(file_id, dest_path):
-    """Faylni Telegram'dan diskka oqim bilan yozadi (tarmoq xatosida qayta urinadi).
+    """Faylni Telegram'dan diskka oqim bilan yozadi.
 
     bot.download_file() butun faylni xotiraga oladi — 100 MB+ videoda bu
     serverni o'ldiradi. Shuning uchun bo'lak-bo'lak yozamiz.
 
     Telegram tez-tez 502/504 va read timeout qaytaradi (ayniqsa yuklama
-    ko'p bo'lganda). Ilgari bitta urinishda yiqilib, foydalanuvchi
-    "xatolik yuz berdi" olardi — endi 4 marta, ortib boruvchi kutish bilan
-    qayta urinamiz.
+    ko'p bo'lganda). Ilgari 4 ta urinish ~30 soniyada tugab, foydalanuvchi
+    "xatolik yuz berdi" olardi. Endi:
+      - urinishlar soni va umumiy vaqt ancha katta (12 urinish / 15 daqiqa);
+      - bir marta olingan file_path saqlanadi — har urinishda getFile
+        yuborilmaydi (504 aynan shundan chiqadi);
+      - yarim qolgan fayl o'chirilmaydi, Range bilan davom ettiriladi.
     """
+    started_at = time.time()
+    url = None
+    expected = 0
     last_error = None
-    for attempt in range(4):
+
+    for attempt in range(DOWNLOAD_ATTEMPTS):
         try:
-            file_info = bot.get_file(file_id)
-            file_path = getattr(file_info, "file_path", None)
-            if not file_path:
-                raise RuntimeError("fayl yo'li topilmadi")
-            url = file_download_url(file_path)
-            with urllib.request.urlopen(url, timeout=SEND_TIMEOUT) as response:
-                with open(dest_path, "wb") as target:
-                    shutil.copyfileobj(response, target, length=1024 * 512)
-            if os.path.getsize(dest_path) > 0:
+            if url is None:
+                file_info = bot.get_file(file_id)
+                file_path = getattr(file_info, "file_path", None)
+                if not file_path:
+                    raise RuntimeError("fayl yo'li topilmadi")
+                expected = int(getattr(file_info, "file_size", 0) or 0)
+                url = file_download_url(file_path)
+
+            _download_stream(url, dest_path)
+            size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+            if expected and size < expected:
+                raise RuntimeError(f"fayl to'liq yuklanmadi ({size}/{expected})")
+            if size > 0:
                 return dest_path
             raise RuntimeError("bo'sh fayl yuklandi")
         except ApiTelegramException as error:
@@ -1814,24 +1896,22 @@ def download_media(file_id, dest_path):
                 raise RuntimeError("fayl Telegram chegarasidan katta") from error
             if code == 429:
                 time.sleep(retry_after(error, 5))
-            elif code < 500 and code != 400:
+            elif 400 <= code < 500:
                 raise  # 401/403 kabi xatolar — qayta urinish foydasiz
+            else:
+                # 5xx: file_path eskirgan bo'lishi mumkin — qaytadan so'raymiz.
+                url = None
         except Exception as error:  # noqa: BLE001 - tarmoq uzilishi, timeout
             last_error = error
 
-        # Qisman yuklangan fayl qolmasin.
-        try:
-            os.remove(dest_path)
-        except OSError:
-            pass
-
-        delay = min(30, 2 ** (attempt + 1))
+        delay = min(20, 2 ** (attempt + 1))
+        if time.time() - started_at + delay > DOWNLOAD_DEADLINE:
+            break
         print(
-            f"[DOWNLOAD] urinish {attempt + 1}/4 xato: "
-            f"{str(last_error)[:120]} — {delay}s dan keyin qayta"
+            f"[DOWNLOAD] urinish {attempt + 1}/{DOWNLOAD_ATTEMPTS} xato: "
+            f"{str(last_error)[:120]} — {delay}s dan keyin davom etadi"
         )
-        if attempt < 3:
-            time.sleep(delay)
+        time.sleep(delay)
 
     raise RuntimeError(
         f"Telegram serveri javob bermadi ({str(last_error)[:90]}). "
@@ -1880,7 +1960,7 @@ def conversion_job(message, kind, status_message_id):
 
         # Bot API orqali yuklash chegarasi 50 MB
         output_mb = os.path.getsize(output_path) / (1024 * 1024)
-        if output_mb > 49:
+        if output_mb > MAX_SEND_MB:
             raise RuntimeError("natija juda katta")
 
         if kind == "to_note":
