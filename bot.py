@@ -165,7 +165,14 @@ SEND_TIMEOUT = _env_int("SEND_TIMEOUT", 3600 if LOCAL_API else 600)
 # qaytaradi (ayniqsa katta faylda): bir marta urinib yiqilish o'rniga
 # belgilangan vaqt ichida davom etamiz va yarim qolgan faylni
 # boshidan emas, qolgan joyidan yuklaymiz.
-DOWNLOAD_TIMEOUT = _env_int("DOWNLOAD_TIMEOUT", SEND_TIMEOUT)
+# Fayl oqimi uchun socket timeout. Uzun bo'lmasligi muhim: osilib qolgan
+# ulanish 5-10 daqiqa kutish o'rniga 45 sekundda uziladi va Range bilan
+# qolgan joyidan davom etadi (ma'lumot oqayotgan bo'lsa timeout ishlamaydi).
+DOWNLOAD_TIMEOUT = _env_int("DOWNLOAD_TIMEOUT", 45)
+# getFile so'rovi uchun timeout. Sukut bo'yicha telebot 120 s kutadi —
+# Telegram javob bermasa foydalanuvchi 2 daqiqa "qayta ishlanmoqda" deb
+# turadi. 25 s yetarli: normal javob 1-2 sekundda keladi.
+GETFILE_TIMEOUT = _env_int("GETFILE_TIMEOUT", 25)
 DOWNLOAD_ATTEMPTS = max(1, _env_int("DOWNLOAD_ATTEMPTS", 12))
 DOWNLOAD_DEADLINE = _env_int("DOWNLOAD_DEADLINE", 900)
 AUDIO_CALLBACK = "extract_audio"
@@ -247,7 +254,7 @@ MENU_BACK = "audio_back"
 
 
 # Deploy qaysi versiyada ishlayotganini logdan bilish uchun.
-BUILD_VERSION = "2026-11-19.01"
+BUILD_VERSION = "2026-11-19.02"
 
 # Diagnostika: /status endpoint va watchdog uchun jonli holat.
 STARTED_AT = time.time()
@@ -1530,7 +1537,12 @@ def make_rectangle_video(input_path, output_path):
 
 
 # --- KO'P VAZIFALI ISHCHI (bir vaqtda cheklangan miqdorda konvertatsiya) ---
-executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="convert")
+# 0.1 CPU (Render Free) da ikkita ffmpeg bir-birini bo'g'adi: ikkala video
+# ham sekinlashadi va polling/yuklab olish oqimlari och qolib, socket
+# read timeout beradi. Bunday muhitda bitta ishchi tezroq natija beradi.
+WORKER_COUNT = max(1, _env_int("MAX_WORKERS", 1 if LOW_CPU else 2))
+executor = ThreadPoolExecutor(max_workers=WORKER_COUNT, thread_name_prefix="convert")
+print(f"[CPU] parallel ishchilar: {WORKER_COUNT}")
 busy_users = set()
 busy_lock = threading.Lock()
 
@@ -1825,6 +1837,14 @@ def file_download_url(file_path):
     return file_url.format(bot.token, file_path)
 
 
+def _get_file_info(file_id):
+    """getFile so'rovi qisqa timeout bilan (telebot sukut bo'yicha 120 s kutadi)."""
+    try:
+        return bot.get_file(file_id, timeout=GETFILE_TIMEOUT)
+    except TypeError:  # eski telebot imzosida `timeout` bo'lmasligi mumkin
+        return bot.get_file(file_id)
+
+
 def _download_stream(url, dest_path):
     """Faylni bo'lak-bo'lak diskka yozadi; uzilsa qolgan joyidan davom etadi.
 
@@ -1860,31 +1880,44 @@ def download_media(file_id, dest_path):
     Telegram tez-tez 502/504 va read timeout qaytaradi (ayniqsa yuklama
     ko'p bo'lganda). Ilgari 4 ta urinish ~30 soniyada tugab, foydalanuvchi
     "xatolik yuz berdi" olardi. Endi:
-      - urinishlar soni va umumiy vaqt ancha katta (12 urinish / 15 daqiqa);
+      - getFile 25 s da uziladi (avval 120 s edi), dastlabki urinishlar
+        kutmasdan darhol takrorlanadi;
       - bir marta olingan file_path saqlanadi — har urinishda getFile
         yuborilmaydi (504 aynan shundan chiqadi);
-      - yarim qolgan fayl o'chirilmaydi, Range bilan davom ettiriladi.
+      - yarim qolgan fayl o'chirilmaydi, Range bilan davom ettiriladi;
+      - umumiy kutish chegarasi fayl hajmiga qarab (kichik video ~5 daqiqa).
     """
     started_at = time.time()
     url = None
     expected = 0
     last_error = None
+    # Kichik faylni 15 daqiqa kutishning ma'nosi yo'q: hajmga qarab oqilona
+    # chegara (2 MB -> ~5 daqiqa, 200 MB -> 15 daqiqa).
+    deadline = DOWNLOAD_DEADLINE
 
     for attempt in range(DOWNLOAD_ATTEMPTS):
         try:
             if url is None:
-                file_info = bot.get_file(file_id)
+                file_info = _get_file_info(file_id)
                 file_path = getattr(file_info, "file_path", None)
                 if not file_path:
                     raise RuntimeError("fayl yo'li topilmadi")
                 expected = int(getattr(file_info, "file_size", 0) or 0)
                 url = file_download_url(file_path)
+                if expected:
+                    deadline = min(
+                        DOWNLOAD_DEADLINE, 300 + int(expected / 1048576) * 4
+                    )
 
             _download_stream(url, dest_path)
             size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
             if expected and size < expected:
                 raise RuntimeError(f"fayl to'liq yuklanmadi ({size}/{expected})")
             if size > 0:
+                print(
+                    f"[DOWNLOAD] tayyor: {size / 1048576:.1f} MB, "
+                    f"{time.time() - started_at:.1f} s"
+                )
                 return dest_path
             raise RuntimeError("bo'sh fayl yuklandi")
         except ApiTelegramException as error:
@@ -1904,14 +1937,18 @@ def download_media(file_id, dest_path):
         except Exception as error:  # noqa: BLE001 - tarmoq uzilishi, timeout
             last_error = error
 
-        delay = min(20, 2 ** (attempt + 1))
-        if time.time() - started_at + delay > DOWNLOAD_DEADLINE:
+        # Dastlabki urinishlar darhol takrorlanadi: bitta osilib qolgan
+        # so'rov 25 s da uziladi va keyingisi shu zahoti boshlanadi.
+        delay = 0 if attempt < 3 else min(20, 2 ** (attempt - 2))
+        if time.time() - started_at + delay > deadline:
             break
         print(
-            f"[DOWNLOAD] urinish {attempt + 1}/{DOWNLOAD_ATTEMPTS} xato: "
-            f"{str(last_error)[:120]} — {delay}s dan keyin davom etadi"
+            f"[DOWNLOAD] urinish {attempt + 1}/{DOWNLOAD_ATTEMPTS} xato "
+            f"({time.time() - started_at:.0f}s): {str(last_error)[:110]} — "
+            f"{f'{delay}s dan keyin davom etadi' if delay else 'darhol qayta'}"
         )
-        time.sleep(delay)
+        if delay:
+            time.sleep(delay)
 
     raise RuntimeError(
         f"Telegram serveri javob bermadi ({str(last_error)[:90]}). "
@@ -1931,14 +1968,17 @@ def conversion_job(message, kind, status_message_id):
     # deb o'ylamasligi uchun (Render Free'da kodlash uzoq davom etadi).
     started_at = time.time()
     stop_ticker = threading.Event()
+    # Qaysi bosqichda turganimiz ko'rinib tursin: foydalanuvchi kutayotganda
+    # "yuklanmoqda" yoki "kodlanmoqda" ekanini biladi.
+    stage = {"text": "⬇️ Telegram'dan yuklanmoqda..."}
 
     def progress_loop():
-        while not stop_ticker.wait(15):
+        while not stop_ticker.wait(10):
             minutes, seconds = divmod(int(time.time() - started_at), 60)
             safe_edit(
                 chat_id,
                 status_message_id,
-                f"⏳ <b>Qayta ishlanmoqda...</b> {minutes}:{seconds:02d}\n"
+                f"⏳ <b>{stage['text']}</b> {minutes}:{seconds:02d}\n"
                 "<i>Tayyor bo'lgach shu yerga yuboraman.</i>",
                 parse_mode="HTML",
             )
@@ -1947,6 +1987,7 @@ def conversion_job(message, kind, status_message_id):
 
     try:
         download_media(media.file_id, input_path)
+        stage["text"] = "⚙️ Video kodlanmoqda..."
 
         try:
             bot.send_chat_action(chat_id, "record_video_note" if kind == "to_note" else "upload_video")
@@ -1957,6 +1998,8 @@ def conversion_job(message, kind, status_message_id):
             make_square_video(input_path, output_path)
         else:
             make_rectangle_video(input_path, output_path)
+
+        stage["text"] = "📤 Yuborilmoqda..."
 
         # Bot API orqali yuklash chegarasi 50 MB
         output_mb = os.path.getsize(output_path) / (1024 * 1024)
